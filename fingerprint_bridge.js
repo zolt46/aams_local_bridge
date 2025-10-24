@@ -12,6 +12,7 @@
 
 const path = require('path');
 const fs = require('fs');
+const fsPromises = fs.promises;
 const { spawn } = require('child_process');
 
 require('dotenv').config({ path: path.join(__dirname, '.env') });
@@ -152,6 +153,177 @@ function normalizeFlag(value){
     if (['false', '0', 'no', 'n', 'off'].includes(trimmed)) return false;
   }
   return Boolean(value);
+}
+
+const TAB_STATIC_FLAG_RAW = process.env.SERVE_TAB_UI ?? process.env.ENABLE_TAB_STATIC;
+let TAB_STATIC_ENABLED = true;
+if (TAB_STATIC_FLAG_RAW !== undefined){
+  const normalized = normalizeFlag(TAB_STATIC_FLAG_RAW);
+  if (normalized !== undefined){
+    TAB_STATIC_ENABLED = normalized;
+  }
+}
+const DEFAULT_TAB_STATIC_ROOT = path.resolve(__dirname, '..', 'AAMS_TAB', 'AAMS_TAB_FRONT');
+const TAB_STATIC_ROOT = path.resolve(process.env.TAB_STATIC_ROOT || DEFAULT_TAB_STATIC_ROOT);
+const TAB_STATIC_ROOT_SAFE = TAB_STATIC_ROOT.endsWith(path.sep) ? TAB_STATIC_ROOT : `${TAB_STATIC_ROOT}${path.sep}`;
+const TAB_STATIC_INDEX = path.join(TAB_STATIC_ROOT, 'index.html');
+let TAB_STATIC_AVAILABLE = false;
+if (TAB_STATIC_ENABLED){
+  try {
+    const rootStats = fs.statSync(TAB_STATIC_ROOT);
+    const indexStats = fs.statSync(TAB_STATIC_INDEX);
+    TAB_STATIC_AVAILABLE = rootStats.isDirectory() && indexStats.isFile();
+  } catch (err) {
+    TAB_STATIC_AVAILABLE = false;
+  }
+}
+const TAB_STATIC_CACHE_CONTROL = 'no-cache, no-store, must-revalidate';
+
+function escapeHtml(value){
+  return String(value ?? '')
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#39;');
+}
+
+function buildBridgeProxyHtml({ origin, token, title }){
+  const safeTitle = (title && typeof title === 'string' && title.trim()) ? title.trim() : 'AAMS 로컬 브릿지 연결';
+  const htmlTitle = escapeHtml(safeTitle);
+  const originJson = JSON.stringify(origin || '');
+  const tokenJson = JSON.stringify(token || '');
+  const titleJson = JSON.stringify(safeTitle);
+
+  const script = `
+(function(){
+  const allowedOrigin = ${originJson};
+  const token = ${tokenJson};
+  const displayTitle = ${titleJson};
+  const openerOrigin = allowedOrigin && allowedOrigin !== '' ? allowedOrigin : '*';
+  const statusEl = document.getElementById('status');
+  const messageEl = document.getElementById('message');
+  const closeBtn = document.getElementById('close-btn');
+  if (closeBtn) {
+    closeBtn.addEventListener('click', () => { try { window.close(); } catch (_) {} });
+  }
+  function setStatus(text){ if (statusEl) statusEl.textContent = text; }
+  function setMessage(text){
+    if (!messageEl) return;
+    if (text){ messageEl.textContent = text; messageEl.hidden = false; }
+    else { messageEl.hidden = true; }
+  }
+  setStatus('브릿지 연결을 준비하고 있습니다…');
+  setMessage('이 창은 로컬 브릿지와 안전하게 통신하기 위한 창입니다. 닫지 말아 주세요.');
+  function post(type, payload){
+    if (!window.opener) return;
+    const target = openerOrigin || '*';
+    try {
+      window.opener.postMessage(Object.assign({ type, token }, payload || {}), target);
+    } catch (err) {
+      console.warn('[fp-bridge-proxy] postMessage 실패', err);
+    }
+  }
+  window.addEventListener('beforeunload', () => { post('fp-proxy-closed', {}); });
+  function isAllowedOrigin(origin){
+    if (!allowedOrigin || allowedOrigin === '*') return true;
+    if (origin === allowedOrigin) return true;
+    if (allowedOrigin === 'null' && origin === 'null') return true;
+    return false;
+  }
+  window.addEventListener('message', async (event) => {
+    if (!isAllowedOrigin(event.origin)) return;
+    const data = event.data || {};
+    if (data.token !== token) return;
+    if (data.type !== 'fp-proxy-request') return;
+    setStatus('로컬 브릿지 요청 처리 중…');
+    const timeout = Math.max(1000, Number(data.timeoutMs) || 18000);
+    const controller = typeof AbortController !== 'undefined' ? new AbortController() : null;
+    const timer = controller ? setTimeout(() => controller.abort(), timeout) : null;
+    try {
+      if (!data.url) throw new Error('invalid_url');
+      const resolved = new URL(data.url, window.location.href);
+      if (resolved.origin !== window.location.origin) {
+        throw new Error('forbidden_origin');
+      }
+      const opts = { method: data.method || 'GET', headers: data.headers || {} };
+      if (controller) opts.signal = controller.signal;
+      if (opts.method !== 'GET' && opts.method !== 'HEAD' && data.body != null) {
+        opts.body = data.body;
+      }
+      const response = await fetch(resolved.toString(), opts);
+      const contentType = response.headers.get('content-type') || '';
+      let text = '';
+      let json = null;
+      if (contentType.includes('application/json')) {
+        try { json = await response.json(); }
+        catch (err) { json = null; text = await response.text(); }
+      } else {
+        text = await response.text();
+      }
+      if (timer) clearTimeout(timer);
+      post('fp-proxy-response', {
+        id: data.id,
+        ok: response.ok,
+        status: response.status,
+        headers: { 'content-type': contentType },
+        json: json,
+        text: json === null ? text : undefined
+      });
+      setStatus('로컬 브릿지 연결 대기 중');
+      setMessage('이 창은 닫지 말아 주세요.');
+    } catch (err) {
+      if (timer) clearTimeout(timer);
+      const code = err && err.name === 'AbortError' ? 'proxy_timeout' : undefined;
+      const message = err && err.message ? err.message : 'proxy_error';
+      post('fp-proxy-response', {
+        id: data.id,
+        transportError: true,
+        error: message,
+        code
+      });
+      setStatus('로컬 브릿지 요청 처리 중 오류가 발생했습니다.');
+      setMessage('오류: ' + message + ' — 창을 닫았다면 다시 열어 주세요.');
+    }
+  });
+  post('fp-proxy-ready', { version: '1.0', title: displayTitle });
+  setStatus('로컬 브릿지 연결이 준비되었습니다. 이 창은 닫지 말아 주세요.');
+})();
+`;
+
+  const safeScript = script.replace(/<\/script>/gi, '<\\/script>');
+
+  return `<!DOCTYPE html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<meta http-equiv="X-UA-Compatible" content="IE=edge">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>${htmlTitle}</title>
+<style>
+  :root { color-scheme: light dark; }
+  body { font-family: system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; margin: 0; padding: 0; background: #111827; color: #f9fafb; display: flex; min-height: 100vh; align-items: center; justify-content: center; }
+  main { background: rgba(17, 24, 39, 0.82); border-radius: 16px; padding: 32px 28px; max-width: 440px; box-shadow: 0 24px 48px rgba(15, 23, 42, 0.4); backdrop-filter: blur(12px); }
+  h1 { font-size: 1.4rem; margin: 0 0 0.75rem; }
+  p { margin: 0 0 0.75rem; line-height: 1.5; }
+  p.muted { color: rgba(226, 232, 240, 0.72); font-size: 0.95rem; }
+  #message[hidden] { display: none; }
+  button { margin-top: 1rem; padding: 0.6rem 1.1rem; font-size: 1rem; border-radius: 999px; border: none; background: #3b82f6; color: #fff; cursor: pointer; }
+  button:hover { background: #2563eb; }
+</style>
+</head>
+<body>
+<main>
+  <h1>${htmlTitle}</h1>
+  <p id="status">브릿지 연결을 준비하고 있습니다…</p>
+  <p id="message" class="muted">이 창은 로컬 브릿지와 안전하게 통신하기 위한 창입니다. 닫지 말아 주세요.</p>
+  <button id="close-btn" type="button">창 닫기</button>
+</main>
+<script>
+${safeScript}
+</script>
+</body>
+</html>`;
 }
 
 function summarizeRobotPayload(payload = {}){
@@ -1132,14 +1304,135 @@ function buildHealthPayload(){
   };
 }
 
-function applyCors(res){
-  res.setHeader('Access-Control-Allow-Origin', '*');
+function applyCors(req, res){
+  const origin = req?.headers?.origin;
+  const varyParts = new Set();
+  if (origin){
+    res.setHeader('Access-Control-Allow-Origin', origin);
+    varyParts.add('Origin');
+  } else {
+    res.setHeader('Access-Control-Allow-Origin', '*');
+  }
   res.setHeader('Access-Control-Allow-Methods', 'GET,POST,OPTIONS');
-  res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
+
+  const requestedHeaders = req?.headers?.['access-control-request-headers'];
+  if (requestedHeaders){
+    res.setHeader('Access-Control-Allow-Headers', requestedHeaders);
+    varyParts.add('Access-Control-Request-Headers');
+  } else {
+    res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
+  }
+
+  if (varyParts.size){
+    res.setHeader('Vary', Array.from(varyParts).join(', '));
+  }
+
+  res.setHeader('Access-Control-Allow-Private-Network', 'true');
 }
 
-function sendJson(res, status, payload){
-  applyCors(res);
+const TAB_STATIC_MIME = {
+  '.html': 'text/html; charset=utf-8',
+  '.htm': 'text/html; charset=utf-8',
+  '.js': 'application/javascript; charset=utf-8',
+  '.mjs': 'application/javascript; charset=utf-8',
+  '.css': 'text/css; charset=utf-8',
+  '.json': 'application/json; charset=utf-8',
+  '.map': 'application/json; charset=utf-8',
+  '.svg': 'image/svg+xml',
+  '.png': 'image/png',
+  '.jpg': 'image/jpeg',
+  '.jpeg': 'image/jpeg',
+  '.gif': 'image/gif',
+  '.ico': 'image/x-icon',
+  '.woff2': 'font/woff2',
+  '.woff': 'font/woff',
+  '.ttf': 'font/ttf',
+  '.txt': 'text/plain; charset=utf-8'
+};
+
+function guessStaticMime(filePath){
+  const ext = path.extname(filePath).toLowerCase();
+  return TAB_STATIC_MIME[ext] || 'application/octet-stream';
+}
+
+async function tryServeStaticAsset(req, res, url){
+  if (!TAB_STATIC_AVAILABLE) return false;
+  if (req.method !== 'GET') return false;
+
+  let resourcePath = url?.pathname || '/';
+  if (!resourcePath || resourcePath === '/'){
+    resourcePath = '/index.html';
+  }
+  if (resourcePath.endsWith('/')){
+    resourcePath = `${resourcePath}index.html`;
+  }
+
+  try {
+    resourcePath = decodeURIComponent(resourcePath);
+  } catch (_) {
+    // keep original encoded path if decoding fails
+  }
+
+  if (resourcePath.includes('\0')){
+    return false;
+  }
+
+  resourcePath = resourcePath.replace(/\\+/g, '/');
+  if (resourcePath.startsWith('/')){
+    resourcePath = resourcePath.slice(1);
+  }
+  if (!resourcePath){
+    resourcePath = 'index.html';
+  }
+
+  const resolvedPath = path.resolve(TAB_STATIC_ROOT, resourcePath);
+  if (resolvedPath !== TAB_STATIC_ROOT && !resolvedPath.startsWith(TAB_STATIC_ROOT_SAFE)){
+    return false;
+  }
+
+  let stats;
+  try {
+    stats = await fsPromises.stat(resolvedPath);
+  } catch (err) {
+    return false;
+  }
+
+  let finalPath = resolvedPath;
+  if (stats.isDirectory()){
+    const indexPath = path.join(resolvedPath, 'index.html');
+    try {
+      const indexStats = await fsPromises.stat(indexPath);
+      if (!indexStats.isFile()){
+        return false;
+      }
+      finalPath = indexPath;
+    } catch (err) {
+      return false;
+    }
+  } else if (!stats.isFile()){
+    return false;
+  }
+
+  try {
+    const data = await fsPromises.readFile(finalPath);
+    const mime = guessStaticMime(finalPath);
+    res.writeHead(200, {
+      'Content-Type': mime,
+      'Cache-Control': TAB_STATIC_CACHE_CONTROL
+    });
+    res.end(data);
+  } catch (err) {
+    warn('static file serve failed:', err?.message || err);
+    if (!res.headersSent){
+      res.writeHead(500, { 'Content-Type': 'text/plain; charset=utf-8' });
+    }
+    res.end('static_error');
+  }
+  return true;
+}
+
+function sendJson(req, res, status, payload){
+  applyCors(req, res);
   res.writeHead(status, { 'content-type': 'application/json; charset=utf-8' });
   res.end(JSON.stringify(payload ?? {}));
 }
@@ -1161,7 +1454,7 @@ async function readJson(req){
 }
 
 async function handleHttpRequest(req, res){
-  applyCors(res);
+  applyCors(req, res);
   if (req.method === 'OPTIONS'){
     res.writeHead(204);
     res.end();
@@ -1173,7 +1466,7 @@ async function handleHttpRequest(req, res){
 
   try {
     if (req.method === 'GET' && pathname === '/health'){
-      return sendJson(res, 200, buildHealthPayload());
+      return sendJson(req, res, 200, buildHealthPayload());
     }
 
     if (req.method === 'POST' && pathname === '/identify/start'){
@@ -1185,7 +1478,7 @@ async function handleHttpRequest(req, res){
         site: body?.site
       });
       identifyLoop();
-      return sendJson(res, 200, {
+      return sendJson(req, res, 200, {
         ok: true,
         session: {
           id: session.id,
@@ -1205,7 +1498,7 @@ async function handleHttpRequest(req, res){
       const turnOffLed = body?.led === false ? false : true;
       const ledOverride = (turnOffLed && body && typeof body.led === 'object') ? body.led : null;
       const session = stopManualIdentify(body?.reason || 'manual_stop', { turnOffLed, ledOverride });
-      return sendJson(res, 200, {
+      return sendJson(req, res, 200, {
         ok: true,
         session: session ? {
           id: session.id,
@@ -1220,7 +1513,7 @@ async function handleHttpRequest(req, res){
     if (req.method === 'POST' && pathname === '/led'){
       const body = await readJson(req);
       const ok = applyLedCommand(body);
-      return sendJson(res, ok ? 200 : 503, {
+      return sendJson(req, res, ok ? 200 : 503, {
         ok,
         led: { ...ledState },
         serial: { connected: !!(serial && serial.isOpen) }
@@ -1254,7 +1547,7 @@ async function handleHttpRequest(req, res){
         });
         if (ledOffCmd) applyLedCommand(ledOffCmd);
         finishCommand(entry, { result });
-        return sendJson(res, 200, { ok: true, result });
+        return sendJson(req, res, 200, { ok: true, result });
       } catch (err) {
         if (ledOffCmd) applyLedCommand(ledOffCmd);
         finishCommand(entry, { error: err });
@@ -1279,11 +1572,11 @@ async function handleHttpRequest(req, res){
           timeoutMs
         });
         finishCommand(entry, { result });
-        return sendJson(res, 200, { ok: true, result });
+        return sendJson(req, res, 200, { ok: true, result });
       } catch (err) {
         finishCommand(entry, { error: err });
         if (allowMissing && err?.payload?.error === 'delete_failed'){
-          return sendJson(res, 200, { ok: true, skipped: true, reason: 'not_found' });
+          return sendJson(req, res, 200, { ok: true, skipped: true, reason: 'not_found' });
         }
         throw err;
       }
@@ -1300,7 +1593,7 @@ async function handleHttpRequest(req, res){
           timeoutMs
         });
         finishCommand(entry, { result });
-        return sendJson(res, 200, { ok: true, result });
+        return sendJson(req, res, 200, { ok: true, result });
       } catch (err) {
         finishCommand(entry, { error: err });
         throw err;
@@ -1318,7 +1611,7 @@ async function handleHttpRequest(req, res){
           timeoutMs
         });
         finishCommand(entry, { result });
-        return sendJson(res, 200, { ok: true, result });
+        return sendJson(req, res, 200, { ok: true, result });
       } catch (err) {
         finishCommand(entry, { error: err });
         throw err;
@@ -1333,7 +1626,7 @@ async function handleHttpRequest(req, res){
         });
         const status = String(result?.status || '').toLowerCase();
         const success = status === 'succeeded';
-        return sendJson(res, success ? 200 : 500, {
+        return sendJson(req, res, success ? 200 : 500, {
           ok: success,
           job: result,
           robot: {
@@ -1345,7 +1638,7 @@ async function handleHttpRequest(req, res){
       } catch (err) {
         const statusCode = err?.statusCode || 504;
         const snapshot = err?.job || sanitizeRobotJob(job, { includePayload: true });
-        return sendJson(res, statusCode, {
+        return sendJson(req, res, statusCode, {
           ok: false,
           error: err?.message || 'robot_failed',
           job: snapshot,
@@ -1357,10 +1650,29 @@ async function handleHttpRequest(req, res){
         });
       }
     }
-    return sendJson(res, 404, { ok: false, error: 'not_found' });
+    if (req.method === 'GET' && (pathname === '/bridge-proxy.html' || pathname === '/bridge-proxy')){
+      const html = buildBridgeProxyHtml({
+        origin: url.searchParams.get('origin') || '',
+        token: url.searchParams.get('token') || '',
+        title: url.searchParams.get('title') || ''
+      });
+      res.writeHead(200, {
+        'Content-Type': 'text/html; charset=utf-8',
+        'Cache-Control': 'no-store, no-cache, must-revalidate'
+      });
+      res.end(html);
+      return;
+    }
+    if (TAB_STATIC_AVAILABLE){
+      const served = await tryServeStaticAsset(req, res, url);
+      if (served){
+        return;
+      }
+    }
+    return sendJson(req, res, 404, { ok: false, error: 'not_found' });
   } catch (err) {
     const status = err?.statusCode || 500;
-    return sendJson(res, status, { ok: false, error: err.message || 'server_error' });
+    return sendJson(req, res, status, { ok: false, error: err.message || 'server_error' });
   }
 }
 
@@ -1385,8 +1697,18 @@ log('env:', {
   ROBOT_SCRIPT: robotState.script || '',
   PYTHON_BIN,
   ROBOT_FORWARD_URL: ROBOT_FORWARD_URL ? '[set]' : '',
-  ROBOT_ENABLED: robotState.enabled
+  ROBOT_ENABLED: robotState.enabled,
+  TAB_STATIC_ENABLED: TAB_STATIC_ENABLED,
+  TAB_STATIC_AVAILABLE: TAB_STATIC_AVAILABLE,
+  TAB_STATIC_ROOT: TAB_STATIC_AVAILABLE ? TAB_STATIC_ROOT : ''
 });
+
+if (TAB_STATIC_ENABLED && !TAB_STATIC_AVAILABLE){
+  warn('TAB UI 정적 파일을 제공하려 했으나 경로를 찾지 못했습니다:', TAB_STATIC_ROOT);
+}
+if (TAB_STATIC_AVAILABLE){
+  log('TAB UI 정적 파일 제공 경로:', TAB_STATIC_ROOT);
+}
 
 setupDebugWS();
 startHttpServer();
