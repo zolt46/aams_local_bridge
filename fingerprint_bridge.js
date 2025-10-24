@@ -12,7 +12,6 @@
 
 const path = require('path');
 const fs = require('fs');
-const fsPromises = fs.promises;
 const { spawn } = require('child_process');
 
 require('dotenv').config({ path: path.join(__dirname, '.env') });
@@ -154,30 +153,6 @@ function normalizeFlag(value){
   }
   return Boolean(value);
 }
-
-const TAB_STATIC_FLAG_RAW = process.env.SERVE_TAB_UI ?? process.env.ENABLE_TAB_STATIC;
-let TAB_STATIC_ENABLED = true;
-if (TAB_STATIC_FLAG_RAW !== undefined){
-  const normalized = normalizeFlag(TAB_STATIC_FLAG_RAW);
-  if (normalized !== undefined){
-    TAB_STATIC_ENABLED = normalized;
-  }
-}
-const DEFAULT_TAB_STATIC_ROOT = path.resolve(__dirname, '..', 'AAMS_TAB', 'AAMS_TAB_FRONT');
-const TAB_STATIC_ROOT = path.resolve(process.env.TAB_STATIC_ROOT || DEFAULT_TAB_STATIC_ROOT);
-const TAB_STATIC_ROOT_SAFE = TAB_STATIC_ROOT.endsWith(path.sep) ? TAB_STATIC_ROOT : `${TAB_STATIC_ROOT}${path.sep}`;
-const TAB_STATIC_INDEX = path.join(TAB_STATIC_ROOT, 'index.html');
-let TAB_STATIC_AVAILABLE = false;
-if (TAB_STATIC_ENABLED){
-  try {
-    const rootStats = fs.statSync(TAB_STATIC_ROOT);
-    const indexStats = fs.statSync(TAB_STATIC_INDEX);
-    TAB_STATIC_AVAILABLE = rootStats.isDirectory() && indexStats.isFile();
-  } catch (err) {
-    TAB_STATIC_AVAILABLE = false;
-  }
-}
-const TAB_STATIC_CACHE_CONTROL = 'no-cache, no-store, must-revalidate';
 
 function summarizeRobotPayload(payload = {}){
   if (!payload || typeof payload !== 'object') return null;
@@ -1183,107 +1158,6 @@ function applyCors(req, res){
   res.setHeader('Access-Control-Allow-Private-Network', 'true');
 }
 
-const TAB_STATIC_MIME = {
-  '.html': 'text/html; charset=utf-8',
-  '.htm': 'text/html; charset=utf-8',
-  '.js': 'application/javascript; charset=utf-8',
-  '.mjs': 'application/javascript; charset=utf-8',
-  '.css': 'text/css; charset=utf-8',
-  '.json': 'application/json; charset=utf-8',
-  '.map': 'application/json; charset=utf-8',
-  '.svg': 'image/svg+xml',
-  '.png': 'image/png',
-  '.jpg': 'image/jpeg',
-  '.jpeg': 'image/jpeg',
-  '.gif': 'image/gif',
-  '.ico': 'image/x-icon',
-  '.woff2': 'font/woff2',
-  '.woff': 'font/woff',
-  '.ttf': 'font/ttf',
-  '.txt': 'text/plain; charset=utf-8'
-};
-
-function guessStaticMime(filePath){
-  const ext = path.extname(filePath).toLowerCase();
-  return TAB_STATIC_MIME[ext] || 'application/octet-stream';
-}
-
-async function tryServeStaticAsset(req, res, url){
-  if (!TAB_STATIC_AVAILABLE) return false;
-  if (req.method !== 'GET') return false;
-
-  let resourcePath = url?.pathname || '/';
-  if (!resourcePath || resourcePath === '/'){
-    resourcePath = '/index.html';
-  }
-  if (resourcePath.endsWith('/')){
-    resourcePath = `${resourcePath}index.html`;
-  }
-
-  try {
-    resourcePath = decodeURIComponent(resourcePath);
-  } catch (_) {
-    // keep original encoded path if decoding fails
-  }
-
-  if (resourcePath.includes('\0')){
-    return false;
-  }
-
-  resourcePath = resourcePath.replace(/\\+/g, '/');
-  if (resourcePath.startsWith('/')){
-    resourcePath = resourcePath.slice(1);
-  }
-  if (!resourcePath){
-    resourcePath = 'index.html';
-  }
-
-  const resolvedPath = path.resolve(TAB_STATIC_ROOT, resourcePath);
-  if (resolvedPath !== TAB_STATIC_ROOT && !resolvedPath.startsWith(TAB_STATIC_ROOT_SAFE)){
-    return false;
-  }
-
-  let stats;
-  try {
-    stats = await fsPromises.stat(resolvedPath);
-  } catch (err) {
-    return false;
-  }
-
-  let finalPath = resolvedPath;
-  if (stats.isDirectory()){
-    const indexPath = path.join(resolvedPath, 'index.html');
-    try {
-      const indexStats = await fsPromises.stat(indexPath);
-      if (!indexStats.isFile()){
-        return false;
-      }
-      finalPath = indexPath;
-    } catch (err) {
-      return false;
-    }
-  } else if (!stats.isFile()){
-    return false;
-  }
-
-  try {
-    const data = await fsPromises.readFile(finalPath);
-    const mime = guessStaticMime(finalPath);
-    res.writeHead(200, {
-      'Content-Type': mime,
-      'Cache-Control': TAB_STATIC_CACHE_CONTROL
-    });
-    res.end(data);
-  } catch (err) {
-    warn('static file serve failed:', err?.message || err);
-    if (!res.headersSent){
-      res.writeHead(500, { 'Content-Type': 'text/plain; charset=utf-8' });
-    }
-    res.end('static_error');
-  }
-  return true;
-}
-
 function sendJson(req, res, status, payload){
   applyCors(req, res);
   res.writeHead(status, { 'content-type': 'application/json; charset=utf-8' });
@@ -1503,12 +1377,6 @@ async function handleHttpRequest(req, res){
         });
       }
     }
-    if (TAB_STATIC_AVAILABLE){
-      const served = await tryServeStaticAsset(req, res, url);
-      if (served){
-        return;
-      }
-    }
     return sendJson(req, res, 404, { ok: false, error: 'not_found' });
   } catch (err) {
     const status = err?.statusCode || 500;
@@ -1537,18 +1405,8 @@ log('env:', {
   ROBOT_SCRIPT: robotState.script || '',
   PYTHON_BIN,
   ROBOT_FORWARD_URL: ROBOT_FORWARD_URL ? '[set]' : '',
-  ROBOT_ENABLED: robotState.enabled,
-  TAB_STATIC_ENABLED: TAB_STATIC_ENABLED,
-  TAB_STATIC_AVAILABLE: TAB_STATIC_AVAILABLE,
-  TAB_STATIC_ROOT: TAB_STATIC_AVAILABLE ? TAB_STATIC_ROOT : ''
+  ROBOT_ENABLED: robotState.enabled
 });
-
-if (TAB_STATIC_ENABLED && !TAB_STATIC_AVAILABLE){
-  warn('TAB UI 정적 파일을 제공하려 했으나 경로를 찾지 못했습니다:', TAB_STATIC_ROOT);
-}
-if (TAB_STATIC_AVAILABLE){
-  log('TAB UI 정적 파일 제공 경로:', TAB_STATIC_ROOT);
-}
 
 setupDebugWS();
 startHttpServer();
