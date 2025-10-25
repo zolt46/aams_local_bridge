@@ -417,6 +417,18 @@ function connectToBackend() {
     });
   });
 
+  ws.on('ping', () => {
+    try {
+      ws.pong();
+      forwardStatus.lastOkAt = timeNow();
+    } catch (err) {
+      warn('failed to reply backend ping:', err?.message || err);
+    }
+  });
+
+  ws.on('pong', () => {
+    forwardStatus.lastOkAt = timeNow();
+  });
 
   ws.on('close', () => {
     backendConnecting = false;
