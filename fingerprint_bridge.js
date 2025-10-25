@@ -3,8 +3,7 @@
  *
  * 기능 요약
  *  - 시리얼 포트를 통해 아두이노 지문 센서를 제어하고 결과를 Render 서버로 전달
- *  - HTTP /health, /identify/start, /identify/stop, /led 엔드포인트를 제공하여
- *    TAB 단말에서 로컬 브릿지 상태 확인 및 지문 인식 세션을 온디맨드로 시작/종료
+ *  - Render 백엔드와의 WebSocket 연결을 유지하며 TAB 단말 명령을 중계
  *  - AUTO_IDENTIFY=1 설정 시 기존처럼 연속 Identify 루프 유지, 기본값은 필요 시에만 스캔
  *
  * 필요한 패키지: serialport, @serialport/parser-readline, ws, dotenv
@@ -19,30 +18,54 @@ require('dotenv').config({ path: path.join(__dirname, '.env') });
 const { SerialPort } = require('serialport');
 const { ReadlineParser } = require('@serialport/parser-readline');
 const WebSocket = require('ws');
-const http = require('http');
-const { URL } = require('url');
+
+function normalizeBackendWsUrl(raw) {
+  if (!raw) return '';
+  try {
+    const url = new URL(raw);
+    url.pathname = '/ws';
+    url.search = url.search || '';
+    return url.toString().replace(/\/$/, '');
+  } catch (err) {
+    if (/^wss?:\/\//i.test(raw)) {
+      const [base, query] = raw.split('?');
+      const trimmed = base.replace(/\/+$/, '');
+      const withPath = /\/ws$/i.test(trimmed) ? trimmed : `${trimmed}/ws`;
+      return query ? `${withPath}?${query}` : withPath;
+    }
+    return raw;
+  }
+}
 
 const PORT_HINT      = process.env.FINGERPRINT_PORT || 'auto';
 const BAUD           = Number(process.env.FINGERPRINT_BAUD || 115200);
 const AUTO_IDENTIFY  = (process.env.AUTO_IDENTIFY || '0') === '1';
 const IDENTIFY_BACKOFF_MS = Number(process.env.IDENTIFY_BACKOFF_MS || 300);
 
-const FORWARD_URL    = process.env.RENDER_FP_URL || '';
+const BACKEND_WS_URL = normalizeBackendWsUrl(
+  process.env.RENDER_WSS_URL
+  || process.env.RENDER_WS_URL
+  || process.env.RENDER_FP_WS_URL
+  || process.env.RENDER_FP_URL
+  || ''
+);
 const FORWARD_TOKEN  = process.env.RENDER_FP_TOKEN || '';
 const FP_SITE        = process.env.FP_SITE || 'default';
-
-const LOCAL_PORT     = Number(process.env.LOCAL_PORT || process.env.FP_LOCAL_PORT || 8790);
 
 const DEBUG_WS       = (process.env.DEBUG_WS || '') === '1';
 const DEBUG_WS_PORT  = Number(process.env.DEBUG_WS_PORT || 8787);
 
 const DEFAULT_LED_ON = { mode: 'breathing', color: 'blue', speed: 18 };
 const DEFAULT_LED_OFF = { mode: 'off' };
+const DEFAULT_ENROLL_TIMEOUT_MS = Number(process.env.ENROLL_TIMEOUT_MS || 70000);
+const DEFAULT_DELETE_TIMEOUT_MS = Number(process.env.DELETE_TIMEOUT_MS || 18000);
+const DEFAULT_CLEAR_TIMEOUT_MS = Number(process.env.CLEAR_TIMEOUT_MS || 25000);
+const DEFAULT_COUNT_TIMEOUT_MS = Number(process.env.COUNT_TIMEOUT_MS || 8000);
 
 const PYTHON_BIN = process.env.PYTHON_BIN || (process.platform === 'win32' ? 'python' : 'python3');
 const ROBOT_SCRIPT = process.env.ROBOT_SCRIPT || path.join(__dirname, 'robot_simulator.py');
 const ROBOT_DISABLED = (process.env.ROBOT_DISABLED || '') === '1';
-const ROBOT_FORWARD_URL = process.env.ROBOT_FORWARD_URL || process.env.RENDER_ROBOT_URL || FORWARD_URL || '';
+const ROBOT_FORWARD_URL = process.env.ROBOT_FORWARD_URL || process.env.RENDER_ROBOT_URL || '';
 const ROBOT_FORWARD_TOKEN = process.env.ROBOT_FORWARD_TOKEN || process.env.RENDER_ROBOT_TOKEN || FORWARD_TOKEN || '';
 
 
@@ -63,8 +86,8 @@ let manualIdentifyRequested = false;
 let manualIdentifyDeadline = 0;
 let activeCommand = null;
 
-const forwardStatus = { enabled: !!FORWARD_URL, lastOkAt: 0, lastErrorAt: 0 };
-const robotForwardStatus = { enabled: !!ROBOT_FORWARD_URL, lastOkAt: 0, lastErrorAt: 0 };
+const forwardStatus = { enabled: !!BACKEND_WS_URL, lastOkAt: 0, lastErrorAt: 0 };
+const robotForwardStatus = { enabled: true, lastOkAt: 0, lastErrorAt: 0 };
 const ledState = { mode: null, color: null, speed: null, cycles: null, ok: null, pending: false, lastCommandAt: 0 };
 let lastIdentifyEvent = null;
 let lastIdentifyAt = 0;
@@ -84,6 +107,348 @@ const robotState = {
 };
 
 const timeNow = () => Date.now();
+
+function scheduleReconnect() {
+  if (reconnectTimer) return;
+  if (!BACKEND_WS_URL) return;
+  const delay = Math.min(reconnectDelayMs, 30000);
+  reconnectTimer = setTimeout(() => {
+    reconnectTimer = null;
+    reconnectDelayMs = Math.min(reconnectDelayMs * 1.5, 30000);
+    connectToBackend();
+  }, delay);
+}
+
+function flushBackendQueue() {
+  if (!backendAuthenticated) return;
+  if (!backendWs || backendWs.readyState !== WebSocket.OPEN) return;
+  while (backendQueue.length) {
+    const payload = backendQueue.shift();
+    try {
+      backendWs.send(JSON.stringify(payload));
+      forwardStatus.lastOkAt = timeNow();
+    } catch (err) {
+      forwardStatus.lastErrorAt = timeNow();
+      warn('backend send failed:', err?.message || err);
+      backendQueue.unshift(payload);
+      try { backendWs.close(); } catch (_) {}
+      break;
+    }
+  }
+}
+
+function sendToBackend(message) {
+  if (!message || typeof message !== 'object') return;
+  backendQueue.push({ site: FP_SITE, ...message });
+  if (backendWs && backendWs.readyState === WebSocket.OPEN && backendAuthenticated) {
+    flushBackendQueue();
+  } else {
+    connectToBackend();
+  }
+}
+
+async function handleBackendMessage(ws, data) {
+  const text = typeof data === 'string' ? data : data?.toString?.();
+  if (!text) return;
+  let message;
+  try {
+    message = JSON.parse(text);
+  } catch (err) {
+    warn('invalid backend message:', err?.message || err);
+    return;
+  }
+  const type = message?.type;
+  if (!type) return;
+
+  if (type === 'AUTH_ACK') {
+    if (message.role === 'bridge') {
+      backendAuthenticated = true;
+      reconnectDelayMs = 2000;
+      forwardStatus.lastOkAt = timeNow();
+      flushBackendQueue();
+    }
+    return;
+  }
+
+  if (type === 'PING') {
+    try {
+      ws.send(JSON.stringify({ type: 'PONG', site: FP_SITE, ts: timeNow() }));
+    } catch (err) {
+      warn('failed to reply pong:', err?.message || err);
+    }
+    return;
+  }
+
+  if (type === 'FP_START_REQUEST') {
+    try {
+      const session = startManualIdentify({
+        timeoutMs: message.timeoutMs || message.timeout_ms || message.payload?.timeoutMs,
+        led: message.led || message.payload?.led,
+        ledOff: message.ledOff || message.payload?.ledOff,
+        site: message.site || FP_SITE
+      });
+      identifyLoop();
+      sendToBackend({ type: 'FP_SESSION_STARTED', session: session ? {
+        id: session.id,
+        requestedAt: session.requestedAt,
+        deadline: session.deadline
+      } : null });
+    } catch (err) {
+      warn('fp start failed:', err?.message || err);
+      sendToBackend({ type: 'FP_SESSION_ERROR', error: err?.message || 'start_failed' });
+    }
+    return;
+  }
+
+  if (type === 'FP_STOP_REQUEST') {
+    try {
+      const reason = message.reason || 'manual';
+      const turnOffLed = message.turnOffLed !== false;
+      const ledOverride = message.led || message.ledOff || null;
+      const session = stopManualIdentify(reason, { turnOffLed, ledOverride });
+      sendToBackend({ type: 'FP_SESSION_STOPPED', session: session ? {
+        id: session.id,
+        active: session.active,
+        reason: session.reason,
+        stoppedAt: session.stoppedAt || timeNow()
+      } : null });
+    } catch (err) {
+      warn('fp stop failed:', err?.message || err);
+      sendToBackend({ type: 'FP_SESSION_ERROR', error: err?.message || 'stop_failed' });
+    }
+    return;
+  }
+
+  if (type === 'LED_COMMAND') {
+    try {
+      const ok = applyLedCommand(message.command || message.payload || message);
+      sendToBackend({ type: 'LED_STATUS', ok, led: { ...ledState } });
+    } catch (err) {
+      warn('led command failed:', err?.message || err);
+      sendToBackend({ type: 'LED_STATUS', ok: false, error: err?.message || 'led_failed', led: { ...ledState } });
+    }
+    return;
+  }
+
+  if (type === 'ROBOT_EXECUTE') {
+    try {
+      const job = startRobotJob(message.payload || {});
+      sendToBackend({ type: 'ROBOT_EVENT', job: sanitizeRobotJob(job, { includePayload: true }) });
+      waitForRobotJob(job, { timeoutMs: Number(message.timeoutMs || message.timeout_ms || 0) || 120000 })
+        .then((result) => {
+          sendToBackend({ type: 'ROBOT_EVENT', job: result, final: true });
+        })
+        .catch((err) => {
+          const snapshot = err?.job || sanitizeRobotJob(job, { includePayload: true });
+          sendToBackend({ type: 'ROBOT_EVENT', job: snapshot, error: err?.message || 'robot_failed' });
+        });
+    } catch (err) {
+      warn('robot execute failed:', err?.message || err);
+      sendToBackend({ type: 'ROBOT_EVENT', error: err?.message || 'robot_failed' });
+    }
+    return;
+  }
+
+  if (type === 'FP_STATUS_REQUEST') {
+    sendToBackend({ type: 'FP_STATUS', serial: {
+      connected: !!(serial && serial.isOpen),
+      path: serial?.path || lastGoodPath || null
+    },
+    manual: manualSession ? { id: manualSession.id, active: manualSession.active, deadline: manualSession.deadline } : null,
+    led: { ...ledState } });
+    return;
+  }
+
+  if (type === 'FP_ENROLL_REQUEST') {
+    const requestId = message.requestId || null;
+    const sensorId = message.sensorId ?? message.sensor_id ?? message.payload?.sensorId ?? message.payload?.sensor_id ?? message.id;
+    try {
+      const led = message.led ?? message.payload?.led ?? DEFAULT_LED_ON;
+      const ledOff = message.ledOff ?? message.payload?.ledOff ?? DEFAULT_LED_OFF;
+      const timeoutMs = message.timeoutMs ?? message.timeout_ms ?? message.payload?.timeoutMs ?? message.payload?.timeout_ms;
+      const result = await enrollFingerprint({ sensorId, timeoutMs, led, ledOff });
+      sendToBackend({
+        type: 'FP_ENROLL_RESULT',
+        ok: true,
+        result,
+        payload: result,
+        sensorId: result?.id ?? (Number(sensorId) || null),
+        requestId
+      });
+    } catch (err) {
+      warn('fp enroll request failed:', err?.message || err);
+      sendToBackend({
+        type: 'FP_ENROLL_RESULT',
+        ok: false,
+        error: err?.message || 'enroll_failed',
+        code: err?.statusCode || err?.status || 500,
+        payload: err?.payload || null,
+        sensorId: Number(sensorId) || null,
+        requestId
+      });
+    }
+    return;
+  }
+
+  if (type === 'FP_DELETE_REQUEST') {
+    const requestId = message.requestId || null;
+    const sensorId = message.sensorId ?? message.sensor_id ?? message.id ?? message.payload?.sensorId ?? message.payload?.sensor_id;
+    const allowMissing = message.allowMissing ?? message.allow_missing ?? message.payload?.allowMissing ?? false;
+    try {
+      const result = await deleteFingerprint({ sensorId, allowMissing, timeoutMs: message.timeoutMs ?? message.timeout_ms });
+      sendToBackend({
+        type: 'FP_DELETE_RESULT',
+        ok: true,
+        result,
+        payload: result,
+        sensorId: Number(sensorId) || null,
+        requestId
+      });
+    } catch (err) {
+      warn('fp delete request failed:', err?.message || err);
+      sendToBackend({
+        type: 'FP_DELETE_RESULT',
+        ok: false,
+        error: err?.message || 'delete_failed',
+        code: err?.statusCode || err?.status || 500,
+        payload: err?.payload || null,
+        sensorId: Number(sensorId) || null,
+        requestId
+      });
+    }
+    return;
+  }
+
+  if (type === 'FP_CLEAR_REQUEST') {
+    const requestId = message.requestId || null;
+    try {
+      const result = await clearFingerprints({ timeoutMs: message.timeoutMs ?? message.timeout_ms });
+      sendToBackend({ type: 'FP_CLEAR_RESULT', ok: true, result, payload: result, requestId });
+    } catch (err) {
+      warn('fp clear request failed:', err?.message || err);
+      sendToBackend({
+        type: 'FP_CLEAR_RESULT',
+        ok: false,
+        error: err?.message || 'clear_failed',
+        code: err?.statusCode || err?.status || 500,
+        payload: err?.payload || null,
+        requestId
+      });
+    }
+    return;
+  }
+
+  if (type === 'FP_COUNT_REQUEST') {
+    const requestId = message.requestId || null;
+    try {
+      const result = await countFingerprints({ timeoutMs: message.timeoutMs ?? message.timeout_ms });
+      const count = result?.count ?? result?.result?.count ?? result?.result;
+      sendToBackend({ type: 'FP_COUNT_RESULT', ok: true, count, result, payload: result, requestId });
+    } catch (err) {
+      warn('fp count request failed:', err?.message || err);
+      sendToBackend({
+        type: 'FP_COUNT_RESULT',
+        ok: false,
+        error: err?.message || 'count_failed',
+        code: err?.statusCode || err?.status || 500,
+        payload: err?.payload || null,
+        requestId
+      });
+    }
+    return;
+  }
+
+  if (type === 'FP_HEALTH_REQUEST') {
+    const requestId = message.requestId || null;
+    try {
+      const status = buildHealthPayload();
+      sendToBackend({ type: 'FP_HEALTH', ok: true, status, payload: status, requestId });
+    } catch (err) {
+      warn('fp health request failed:', err?.message || err);
+      sendToBackend({
+        type: 'FP_HEALTH_ERROR',
+        ok: false,
+        error: err?.message || 'health_failed',
+        code: err?.statusCode || err?.status || 500,
+        requestId
+      });
+    }
+    return;
+  }
+}
+
+function connectToBackend() {
+  if (!BACKEND_WS_URL) {
+    warn('RENDER_WSS_URL not configured; backend relay disabled');
+    return;
+  }
+  if (backendConnecting) return;
+  if (backendWs && backendWs.readyState === WebSocket.OPEN) {
+    if (!backendAuthenticated) {
+      try {
+        backendWs.send(JSON.stringify({ type: 'AUTH_BRIDGE', site: FP_SITE, token: FORWARD_TOKEN || undefined }));
+      } catch (err) {
+        warn('failed to send auth message:', err?.message || err);
+      }
+    }
+    return;
+  }
+
+  backendConnecting = true;
+  const ws = new WebSocket(BACKEND_WS_URL);
+  backendWs = ws;
+  backendAuthenticated = false;
+
+  ws.on('open', () => {
+    backendConnecting = false;
+    reconnectDelayMs = 2000;
+    try {
+      ws.send(JSON.stringify({ type: 'AUTH_BRIDGE', site: FP_SITE, token: FORWARD_TOKEN || undefined }));
+    } catch (err) {
+      warn('failed to send auth:', err?.message || err);
+    }
+    forwardStatus.lastOkAt = timeNow();
+    flushBackendQueue();
+  });
+
+  ws.on('message', (data) => {
+    Promise.resolve(handleBackendMessage(ws, data)).catch((err) => {
+      warn('backend message handler failed:', err?.message || err);
+    });
+  });
+
+
+  ws.on('close', () => {
+    backendConnecting = false;
+    backendAuthenticated = false;
+    if (backendWs === ws) {
+      backendWs = null;
+    }
+    forwardStatus.lastErrorAt = timeNow();
+    scheduleReconnect();
+  });
+
+  ws.on('error', (err) => {
+    warn('backend ws error:', err?.message || err);
+  });
+
+  ws.on('unexpected-response', (_req, res) => {
+    backendConnecting = false;
+    backendAuthenticated = false;
+    const status = res?.statusCode;
+    const statusMessage = res?.statusMessage;
+    warn('backend ws unexpected response:', status, statusMessage);
+    try { res?.resume?.(); } catch (_) {}
+    forwardStatus.lastErrorAt = timeNow();
+    scheduleReconnect();
+  });
+}
+let backendWs = null;
+let backendAuthenticated = false;
+let backendConnecting = false;
+let reconnectTimer = null;
+let reconnectDelayMs = 2000;
+const backendQueue = [];
 
 function httpError(status, message){
   const err = new Error(message || 'error');
@@ -459,32 +824,98 @@ async function runSensorCommand({ command, payload = {}, expectedType, timeoutMs
   return result;
 }
 
-async function forwardToRender(obj, { url = FORWARD_URL, token = FORWARD_TOKEN, statusRef = forwardStatus } = {}){
-  if (!url) return;
-  try {
-    const headers = {
-      'content-type': 'application/json'
-    };
-    if (token) {
-      headers['x-fp-token'] = token;
-      headers['x-robot-token'] = token;
-    }
-    const res = await fetch(url, {
-      method: 'POST',
-      headers,
-      body: JSON.stringify({ site: FP_SITE, data: obj })
-    });
-    if (!res.ok){
-      if (statusRef) statusRef.lastErrorAt = timeNow();
-      const text = await res.text().catch(() => '');
-      warn('forward failed:', res.status, res.statusText, text || '');
-    } else {
-      if (statusRef) statusRef.lastOkAt = timeNow();
-    }
-  } catch (err) {
-    if (statusRef) statusRef.lastErrorAt = timeNow();
-    warn('forward error:', err.message || err);
+async function enrollFingerprint({ sensorId, timeoutMs, led, ledOff }){
+  const id = Number(sensorId || 0);
+  if (!Number.isInteger(id) || id <= 0){
+    throw httpError(400, 'bad_sensor_id');
   }
+  const entry = beginCommand('enroll', { sensorId: id });
+  try {
+    const commandTimeout = Math.max(5000, Number(timeoutMs) || DEFAULT_ENROLL_TIMEOUT_MS);
+    if (led && led !== false) {
+      try { applyLedCommand(led); }
+      catch (err) { warn('led command failed before enroll:', err?.message || err); }
+    }
+    const result = await runSensorCommand({
+      command: 'enroll',
+      payload: { id },
+      expectedType: 'enroll',
+      timeoutMs: commandTimeout
+    });
+    finishCommand(entry, { result });
+    if (ledOff !== false) {
+      const off = ledOff ? normalizeLedCommand(ledOff) : DEFAULT_LED_OFF;
+      if (off) {
+        try { applyLedCommand(off); }
+        catch (err) { warn('led command failed after enroll:', err?.message || err); }
+      }
+    }
+    return result;
+  } catch (err) {
+    finishCommand(entry, { error: err });
+    throw err;
+  }
+}
+
+async function deleteFingerprint({ sensorId, allowMissing = false, timeoutMs }){
+  const id = Number(sensorId || 0);
+  if (!Number.isInteger(id) || id <= 0){
+    throw httpError(400, 'bad_sensor_id');
+  }
+  const entry = beginCommand('delete', { sensorId: id });
+  try {
+    const result = await runSensorCommand({
+      command: 'delete',
+      payload: { id },
+      expectedType: 'delete',
+      timeoutMs: Math.max(4000, Number(timeoutMs) || DEFAULT_DELETE_TIMEOUT_MS)
+    });
+    finishCommand(entry, { result });
+    return result;
+  } catch (err) {
+    finishCommand(entry, { error: err });
+    if (allowMissing && err?.payload?.error === 'delete_failed') {
+      return { ok: true, skipped: true, id };
+    }
+    throw err;
+  }
+}
+
+async function clearFingerprints({ timeoutMs } = {}){
+  const entry = beginCommand('clear', {});
+  try {
+    const result = await runSensorCommand({
+      command: 'clear',
+      expectedType: 'clear',
+      timeoutMs: Math.max(4000, Number(timeoutMs) || DEFAULT_CLEAR_TIMEOUT_MS)
+    });
+    finishCommand(entry, { result });
+    return result;
+  } catch (err) {
+    finishCommand(entry, { error: err });
+    throw err;
+  }
+}
+
+async function countFingerprints({ timeoutMs } = {}){
+  const entry = beginCommand('count', {});
+  try {
+    const result = await runSensorCommand({
+      command: 'count',
+      expectedType: 'count',
+      timeoutMs: Math.max(2000, Number(timeoutMs) || DEFAULT_COUNT_TIMEOUT_MS)
+    });
+    finishCommand(entry, { result });
+    return result;
+  } catch (err) {
+    finishCommand(entry, { error: err });
+    throw err;
+  }
+}
+
+function forwardToRender(obj) {
+  if (!BACKEND_WS_URL) return;
+  sendToBackend({ type: 'FP_EVENT', payload: obj });
 }
 
 let wsServer = null;
@@ -583,20 +1014,7 @@ function recordRobotHistory(job){
   }
 }
 
-function getForwardConfig(job){
-  if (job?.forward && job.forward.url) {
-    robotForwardStatus.enabled = true;
-    return job.forward;
-  }
-  if (ROBOT_FORWARD_URL) {
-    return { url: ROBOT_FORWARD_URL, token: ROBOT_FORWARD_TOKEN || null };
-  }
-  return null;
-}
-
 function forwardRobotEvent(job, update = {}){
-  const forward = getForwardConfig(job);
-  if (!forward || !forward.url) return;
   const payload = {
     channel: 'robot',
     site: job?.site || FP_SITE,
@@ -615,7 +1033,7 @@ function forwardRobotEvent(job, update = {}){
       meta: update.meta || job?.payloadPreview || null
     }
   };
-  forwardToRender(payload, { url: forward.url, token: forward.token || null, statusRef: robotForwardStatus });
+  sendToBackend({ type: 'ROBOT_EVENT', site: payload.site, job: payload.job, channel: payload.channel });
 }
 
 function finalizeRobotJob(job, status, info = {}){
@@ -1132,284 +1550,22 @@ function buildHealthPayload(){
   };
 }
 
-function applyCors(req, res){
-  const origin = req?.headers?.origin;
-  const varyParts = new Set();
-  if (origin){
-    res.setHeader('Access-Control-Allow-Origin', origin);
-    varyParts.add('Origin');
-  } else {
-    res.setHeader('Access-Control-Allow-Origin', '*');
-  }
-  res.setHeader('Access-Control-Allow-Methods', 'GET,POST,OPTIONS');
-
-  const requestedHeaders = req?.headers?.['access-control-request-headers'];
-  if (requestedHeaders){
-    res.setHeader('Access-Control-Allow-Headers', requestedHeaders);
-    varyParts.add('Access-Control-Request-Headers');
-  } else {
-    res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
-  }
-
-  if (varyParts.size){
-    res.setHeader('Vary', Array.from(varyParts).join(', '));
-  }
-
-  res.setHeader('Access-Control-Allow-Private-Network', 'true');
-}
-
-function sendJson(req, res, status, payload){
-  applyCors(req, res);
-  res.writeHead(status, { 'content-type': 'application/json; charset=utf-8' });
-  res.end(JSON.stringify(payload ?? {}));
-}
-
-async function readJson(req){
-  const chunks = [];
-  for await (const chunk of req){ chunks.push(chunk); }
-  if (!chunks.length) return {};
-  const raw = Buffer.concat(chunks).toString('utf8').trim();
-  if (!raw) return {};
-  try {
-    return JSON.parse(raw);
-  } catch (err) {
-    const error = new Error('invalid_json');
-    error.statusCode = 400;
-    error.message = err.message || 'invalid_json';
-    throw error;
-  }
-}
-
-async function handleHttpRequest(req, res){
-  applyCors(req, res);
-  if (req.method === 'OPTIONS'){
-    res.writeHead(204);
-    res.end();
-    return;
-  }
-
-  const url = new URL(req.url || '/', `http://${req.headers.host || 'localhost'}`);
-  const pathname = url.pathname;
-
-  try {
-    if (req.method === 'GET' && pathname === '/health'){
-      return sendJson(req, res, 200, buildHealthPayload());
-    }
-
-    if (req.method === 'POST' && pathname === '/identify/start'){
-      const body = await readJson(req);
-      const session = startManualIdentify({
-        timeoutMs: body?.timeoutMs,
-        led: body?.led,
-        ledOff: body?.ledOff || body?.onStopLed,
-        site: body?.site
-      });
-      identifyLoop();
-      return sendJson(req, res, 200, {
-        ok: true,
-        session: {
-          id: session.id,
-          requestedAt: session.requestedAt,
-          deadline: session.deadline
-        },
-        serial: {
-          connected: !!(serial && serial.isOpen),
-          path: (serial && serial.path) || lastGoodPath || null
-        },
-        led: { ...ledState }
-      });
-    }
-
-    if (req.method === 'POST' && pathname === '/identify/stop'){
-      const body = await readJson(req);
-      const turnOffLed = body?.led === false ? false : true;
-      const ledOverride = (turnOffLed && body && typeof body.led === 'object') ? body.led : null;
-      const session = stopManualIdentify(body?.reason || 'manual_stop', { turnOffLed, ledOverride });
-      return sendJson(req, res, 200, {
-        ok: true,
-        session: session ? {
-          id: session.id,
-          active: session.active,
-          reason: session.reason || null,
-          stoppedAt: session.stoppedAt || null
-        } : null,
-        led: { ...ledState }
-      });
-    }
-
-    if (req.method === 'POST' && pathname === '/led'){
-      const body = await readJson(req);
-      const ok = applyLedCommand(body);
-      return sendJson(req, res, ok ? 200 : 503, {
-        ok,
-        led: { ...ledState },
-        serial: { connected: !!(serial && serial.isOpen) }
-      });
-    }
-    if (req.method === 'POST' && pathname === '/enroll'){
-      const body = await readJson(req);
-      const id = Number.parseInt(body?.id, 10);
-      if (!Number.isInteger(id) || id <= 0){
-        throw httpError(400, 'missing_or_bad_id');
-      }
-      const timeoutMs = Math.max(10000, Number(body?.timeoutMs) || 45000);
-      const entry = beginCommand('enroll', { id });
-      const ledOnRaw = body?.led === false ? null : (normalizeLedCommand(body?.led) || DEFAULT_LED_ON);
-      const ledOffRaw = body?.ledOff === false ? null : (normalizeLedCommand(body?.ledOff || body?.onStopLed) || DEFAULT_LED_OFF);
-      const ledOnCmd = ledOnRaw ? { ...DEFAULT_LED_ON, ...ledOnRaw } : null;
-      const ledOffCmd = ledOffRaw ? { ...DEFAULT_LED_OFF, ...ledOffRaw } : null;
-      try {
-        stopManualIdentify('command', { turnOffLed: false });
-        if (ledOnCmd) applyLedCommand(ledOnCmd);
-        const result = await runSensorCommand({
-          command: 'enroll',
-          payload: { id },
-          expectedType: 'enroll',
-          timeoutMs,
-          onStage: (stage) => {
-            entry.meta.stage = stage.stage || null;
-            entry.meta.message = stage.msg || stage.message || null;
-            entry.meta.updatedAt = timeNow();
-          }
-        });
-        if (ledOffCmd) applyLedCommand(ledOffCmd);
-        finishCommand(entry, { result });
-        return sendJson(req, res, 200, { ok: true, result });
-      } catch (err) {
-        if (ledOffCmd) applyLedCommand(ledOffCmd);
-        finishCommand(entry, { error: err });
-        throw err;
-      }
-    }
-    if (req.method === 'POST' && pathname === '/delete'){
-      const body = await readJson(req);
-      const id = Number.parseInt(body?.id, 10);
-      if (!Number.isInteger(id) || id <= 0){
-        throw httpError(400, 'missing_or_bad_id');
-      }
-      const allowMissing = body?.allowMissing === true || body?.allow_missing === true;
-      const timeoutMs = Math.max(6000, Number(body?.timeoutMs) || 15000);
-      const entry = beginCommand('delete', { id });
-      try {
-        stopManualIdentify('command', { turnOffLed: false });
-        const result = await runSensorCommand({
-          command: 'delete',
-          payload: { id },
-          expectedType: 'delete',
-          timeoutMs
-        });
-        finishCommand(entry, { result });
-        return sendJson(req, res, 200, { ok: true, result });
-      } catch (err) {
-        finishCommand(entry, { error: err });
-        if (allowMissing && err?.payload?.error === 'delete_failed'){
-          return sendJson(req, res, 200, { ok: true, skipped: true, reason: 'not_found' });
-        }
-        throw err;
-      }
-    }
-    if (req.method === 'POST' && pathname === '/clear'){
-      const body = await readJson(req);
-      const timeoutMs = Math.max(8000, Number(body?.timeoutMs) || 20000);
-      const entry = beginCommand('clear');
-      try {
-        stopManualIdentify('command', { turnOffLed: false });
-        const result = await runSensorCommand({
-          command: 'clear',
-          expectedType: 'clear',
-          timeoutMs
-        });
-        finishCommand(entry, { result });
-        return sendJson(req, res, 200, { ok: true, result });
-      } catch (err) {
-        finishCommand(entry, { error: err });
-        throw err;
-      }
-    }
-    if (req.method === 'GET' && pathname === '/count'){
-      const timeoutParam = url.searchParams.get('timeoutMs') || url.searchParams.get('timeout_ms');
-      const timeoutMs = Math.max(5000, Number(timeoutParam) || 10000);
-      const entry = beginCommand('count');
-      try {
-        stopManualIdentify('command', { turnOffLed: false });
-        const result = await runSensorCommand({
-          command: 'count',
-          expectedType: 'count',
-          timeoutMs
-        });
-        finishCommand(entry, { result });
-        return sendJson(req, res, 200, { ok: true, result });
-      } catch (err) {
-        finishCommand(entry, { error: err });
-        throw err;
-      }
-    }
-    if (req.method === 'POST' && pathname === '/robot/execute'){
-      const body = await readJson(req);
-      const job = startRobotJob(body || {});
-      try {
-        const result = await waitForRobotJob(job, {
-          timeoutMs: Number(body?.timeoutMs || body?.timeout_ms || 0) || 120000
-        });
-        const status = String(result?.status || '').toLowerCase();
-        const success = status === 'succeeded';
-        return sendJson(req, res, success ? 200 : 500, {
-          ok: success,
-          job: result,
-          robot: {
-            enabled: robotState.enabled,
-            script: robotState.script,
-            python: robotState.python
-          }
-        });
-      } catch (err) {
-        const statusCode = err?.statusCode || 504;
-        const snapshot = err?.job || sanitizeRobotJob(job, { includePayload: true });
-        return sendJson(req, res, statusCode, {
-          ok: false,
-          error: err?.message || 'robot_failed',
-          job: snapshot,
-          robot: {
-            enabled: robotState.enabled,
-            script: robotState.script,
-            python: robotState.python
-          }
-        });
-      }
-    }
-    return sendJson(req, res, 404, { ok: false, error: 'not_found' });
-  } catch (err) {
-    const status = err?.statusCode || 500;
-    return sendJson(req, res, status, { ok: false, error: err.message || 'server_error' });
-  }
-}
-
-function startHttpServer(){
-  const server = http.createServer(handleHttpRequest);
-  server.listen(LOCAL_PORT, '0.0.0.0', () => {
-    log(`local HTTP bridge listening on http://0.0.0.0:${LOCAL_PORT}`);
-  });
-  server.on('error', err => warn('http server error:', err.message || err));
-}
-
 log('env:', {
   PORT_HINT,
   BAUD,
   AUTO_IDENTIFY,
   IDENTIFY_BACKOFF_MS,
-  FORWARD_URL: FORWARD_URL ? '[set]' : '',
+  BACKEND_WS_URL: BACKEND_WS_URL ? '[set]' : '',
   FP_SITE,
-  LOCAL_PORT,
   DEBUG_WS,
   DEBUG_WS_PORT,
   ROBOT_SCRIPT: robotState.script || '',
   PYTHON_BIN,
-  ROBOT_FORWARD_URL: ROBOT_FORWARD_URL ? '[set]' : '',
   ROBOT_ENABLED: robotState.enabled
 });
 
 setupDebugWS();
-startHttpServer();
+connectToBackend();
 identifyLoop().catch(err => warn('identify loop exited:', err?.message || err));
 
 (async () => {
