@@ -231,16 +231,18 @@ async function handleBackendMessage(ws, data) {
   }
 
   if (type === 'ROBOT_EXECUTE') {
+    const relayRequestId = message.requestId || message.request_id || null;
     try {
       const job = startRobotJob(message.payload || {});
-      sendToBackend({ type: 'ROBOT_EVENT', job: sanitizeRobotJob(job, { includePayload: true }) });
+      const basePayload = { type: 'ROBOT_EVENT', requestId: relayRequestId, job: sanitizeRobotJob(job, { includePayload: true }) };
+      sendToBackend(basePayload);
       waitForRobotJob(job, { timeoutMs: Number(message.timeoutMs || message.timeout_ms || 0) || 120000 })
         .then((result) => {
-          sendToBackend({ type: 'ROBOT_EVENT', job: result, final: true });
+          sendToBackend({ type: 'ROBOT_EVENT', requestId: relayRequestId, job: result, final: true });
         })
         .catch((err) => {
           const snapshot = err?.job || sanitizeRobotJob(job, { includePayload: true });
-          sendToBackend({ type: 'ROBOT_EVENT', job: snapshot, error: err?.message || 'robot_failed' });
+      sendToBackend({ type: 'ROBOT_EVENT', requestId: relayRequestId, error: err?.message || 'robot_failed' });
         });
     } catch (err) {
       warn('robot execute failed:', err?.message || err);
@@ -1047,7 +1049,7 @@ function forwardRobotEvent(job, update = {}){
       meta: update.meta || job?.payloadPreview || null
     }
   };
-  sendToBackend({ type: 'ROBOT_EVENT', site: payload.site, job: payload.job, channel: payload.channel });
+  sendToBackend({ type: 'ROBOT_EVENT', site: payload.site, job: payload.job, channel: payload.channel, requestId: job?.requestId ?? null });
 }
 
 function finalizeRobotJob(job, status, info = {}){
