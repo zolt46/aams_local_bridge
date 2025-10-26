@@ -842,6 +842,7 @@ async function enrollFingerprint({ sensorId, timeoutMs, led, ledOff }){
     throw httpError(400, 'bad_sensor_id');
   }
   const entry = beginCommand('enroll', { sensorId: id });
+  const ledOffCommand = ledOff === false ? null : (ledOff ? normalizeLedCommand(ledOff) : DEFAULT_LED_OFF);
   try {
     const commandTimeout = Math.max(5000, Number(timeoutMs) || DEFAULT_ENROLL_TIMEOUT_MS);
     if (led && led !== false) {
@@ -855,16 +856,17 @@ async function enrollFingerprint({ sensorId, timeoutMs, led, ledOff }){
       timeoutMs: commandTimeout
     });
     finishCommand(entry, { result });
-    if (ledOff !== false) {
-      const off = ledOff ? normalizeLedCommand(ledOff) : DEFAULT_LED_OFF;
-      if (off) {
-        try { applyLedCommand(off); }
-        catch (err) { warn('led command failed after enroll:', err?.message || err); }
-      }
+    if (ledOffCommand) {
+      try { applyLedCommand(ledOffCommand); }
+      catch (err) { warn('led command failed after enroll:', err?.message || err); }
     }
     return result;
   } catch (err) {
     finishCommand(entry, { error: err });
+    if (ledOffCommand) {
+      try { applyLedCommand(ledOffCommand); }
+      catch (ledErr) { warn('led command failed after enroll error:', ledErr?.message || ledErr); }
+    }
     throw err;
   }
 }
