@@ -1490,7 +1490,16 @@ function startRobotJob(payload = {}){
     PYTHONIOENCODING: 'utf-8',
     PYTHONUNBUFFERED: '1'
   };
-  const proc = spawn(robotState.python || PYTHON_BIN, [robotState.script, ...scriptArgs], { env });
+  const scriptCwd = path.dirname(robotState.script);
+  const resolvedCwd = scriptCwd && scriptCwd !== '.' && fs.existsSync(scriptCwd) ? scriptCwd : undefined;
+  const proc = spawn(
+    robotState.python || PYTHON_BIN,
+    [robotState.script, ...scriptArgs],
+    {
+      env,
+      cwd: resolvedCwd,
+    }
+  );
   if (proc.stdin && typeof proc.stdin.setDefaultEncoding === 'function') {
     proc.stdin.setDefaultEncoding('utf8');
   }
