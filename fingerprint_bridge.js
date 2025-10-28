@@ -63,7 +63,8 @@ const DEFAULT_CLEAR_TIMEOUT_MS = Number(process.env.CLEAR_TIMEOUT_MS || 25000);
 const DEFAULT_COUNT_TIMEOUT_MS = Number(process.env.COUNT_TIMEOUT_MS || 8000);
 
 const PYTHON_BIN = process.env.PYTHON_BIN || (process.platform === 'win32' ? 'python' : 'python3');
-const ROBOT_SCRIPT = process.env.ROBOT_SCRIPT || path.join(__dirname, 'robot_simulator.py');
+const DEFAULT_ROBOT_SCRIPT = path.join(__dirname, '..', 'AAMS_ROBOT+RL+VIS', 'mission_controller_with_vision.py');
+const ROBOT_SCRIPT = process.env.ROBOT_SCRIPT || DEFAULT_ROBOT_SCRIPT;
 const ROBOT_DISABLED = (process.env.ROBOT_DISABLED || '') === '1';
 const ROBOT_FORWARD_URL = process.env.ROBOT_FORWARD_URL || process.env.RENDER_ROBOT_URL || '';
 const ROBOT_FORWARD_TOKEN = process.env.ROBOT_FORWARD_TOKEN || process.env.RENDER_ROBOT_TOKEN || FORWARD_TOKEN || '';
@@ -105,6 +106,8 @@ const robotState = {
   history: [],
   lastEventAt: 0
 };
+
+const activeJobsByRequestId = new Map();
 
 const timeNow = () => Date.now();
 
@@ -247,6 +250,76 @@ async function handleBackendMessage(ws, data) {
     } catch (err) {
       warn('robot execute failed:', err?.message || err);
       sendToBackend({ type: 'ROBOT_EVENT', error: err?.message || 'robot_failed' });
+    }
+    return;
+  }
+
+  if (type === 'ROBOT_INTERACTION') {
+    const requestId = message.requestId || message.request_id || null;
+    const action = message.action || message.command || 'resume';
+    const token = message.token || null;
+    const stage = message.stage || null;
+    const job = requestId ? activeJobsByRequestId.get(String(requestId)) : null;
+    if (!job || !job.process || job.process.killed) {
+      warn('robot interaction ignored: job not found', { requestId, action });
+      sendToBackend({
+        type: 'ROBOT_EVENT',
+        requestId,
+        error: 'interaction_job_missing',
+        action,
+        stage
+      });
+      return;
+    }
+
+    let resolvedToken = token;
+    if (!resolvedToken && stage && job.interactions instanceof Map) {
+      resolvedToken = job.interactions.get(stage) || null;
+    }
+    if (!resolvedToken && job.pendingTokens instanceof Map && job.pendingTokens.size === 1) {
+      const [[pendingToken]] = job.pendingTokens.entries();
+      resolvedToken = pendingToken;
+    }
+
+    if (!resolvedToken) {
+      warn('robot interaction token not found', { requestId, action, stage });
+      sendToBackend({
+        type: 'ROBOT_EVENT',
+        requestId,
+        error: 'interaction_token_missing',
+        action,
+        stage
+      });
+      return;
+    }
+
+    const commandPayload = {
+      command: action,
+      token: resolvedToken,
+      stage: stage || job.stage || 'await_user',
+      meta: message.meta || null
+    };
+
+    try {
+      job.process.stdin.write(`${JSON.stringify(commandPayload)}\n`);
+      job.logs?.push?.({ type: 'stdin', text: JSON.stringify(commandPayload), at: timeNow() });
+      forwardRobotEvent(job, {
+        status: 'progress',
+        stage: job.stage,
+        message: `interaction:${action}`,
+        progress: { event: 'interaction', action, stage: commandPayload.stage, token: resolvedToken },
+        meta: { interaction: commandPayload }
+      });
+    } catch (err) {
+      warn('failed to forward interaction', err?.message || err);
+      sendToBackend({
+        type: 'ROBOT_EVENT',
+        requestId,
+        error: 'interaction_write_failed',
+        message: err?.message || String(err),
+        action,
+        stage
+      });
     }
     return;
   }
@@ -533,12 +606,101 @@ function normalizeFlag(value){
   return Boolean(value);
 }
 
+function createToken(prefix = 'stage'){
+  const suffix = Math.random().toString(16).slice(2, 8);
+  return `${prefix}-${Date.now().toString(36)}-${suffix}`;
+}
+
+function resolveDirection(payload = {}, summary = null){
+  const direct = payload.direction || payload.mode || payload.type;
+  const fromSummary = summary && summary.action ? summary.action : null;
+  const candidate = (direct || fromSummary || '').toString().toLowerCase();
+  if (['return', 'incoming', 'in', '입고', '불입'].includes(candidate)) return 'in';
+  if (['dispatch', 'issue', 'out', '불출'].includes(candidate)) return 'out';
+  return fromSummary === 'return' ? 'in' : 'out';
+}
+
+function resolveLocker(payload = {}, summary = null){
+  return payload.locker
+    || payload.mission
+    || payload.missionLabel
+    || payload.mission_label
+    || (summary && summary.locker)
+    || null;
+}
+
+function parseMissionNumber(raw, fallback = 1){
+  if (raw === null || raw === undefined) return fallback;
+  if (typeof raw === 'number' && Number.isFinite(raw)) {
+    const num = Math.round(raw);
+    if (num === 1 || num === 2) return num;
+    if (num > 2) return ((num - 1) % 2) + 1;
+  }
+  const text = String(raw).trim();
+  if (!text) return fallback;
+  const match = text.match(/(\d+)/);
+  if (match) {
+    const num = Number.parseInt(match[1], 10);
+    if (Number.isFinite(num)) {
+      if (num === 1 || num === 2) return num;
+      if (num > 2) return ((num - 1) % 2) + 1;
+    }
+  }
+  if (/2/.test(text)) return 2;
+  return fallback;
+}
+
+function buildRobotScriptArgs(payload = {}, summary = null){
+  const args = ['--bridge-mode', '--auto'];
+  const direction = resolveDirection(payload, summary);
+  args.push('--direction', direction === 'in' ? 'in' : 'out');
+
+  const locker = resolveLocker(payload, summary);
+  if (locker) {
+    args.push('--mission-label', String(locker));
+  }
+  const missionSource = payload.mission ?? locker ?? null;
+  const missionNumber = parseMissionNumber(missionSource, 1);
+  args.push('--mission', String(missionNumber));
+
+  const firearmSerial = payload.firearmSerial
+    || payload.expectedQr
+    || payload.expected_qr
+    || (summary && summary.firearmCode)
+    || null;
+  if (firearmSerial) {
+    args.push('--expected-qr', String(firearmSerial));
+  }
+
+  const includesAmmo = Object.prototype.hasOwnProperty.call(payload, 'includesAmmo')
+    ? normalizeFlag(payload.includesAmmo)
+    : (summary ? !!summary.includes?.ammo : undefined);
+  if (includesAmmo) {
+    args.push('--with-mag');
+  }
+
+  if (payload.requestId || payload.request_id) {
+    args.push('--request-id', String(payload.requestId ?? payload.request_id));
+  }
+
+  if (payload.site || payload.site_id) {
+    args.push('--site', String(payload.site || payload.site_id));
+  }
+
+  return args;
+}
+
 function summarizeRobotPayload(payload = {}){
   if (!payload || typeof payload !== 'object') return null;
 
-  const dispatch = (payload.dispatch && typeof payload.dispatch === 'object') ? payload.dispatch : {};
+  const bridgePayload = (payload.bridgePayload && typeof payload.bridgePayload === 'object')
+    ? payload.bridgePayload
+    : null;
+  const merged = bridgePayload ? { ...payload, ...bridgePayload } : payload;
 
-  const includesInput = (payload.includes && typeof payload.includes === 'object') ? payload.includes : {};
+  const dispatch = (merged.dispatch && typeof merged.dispatch === 'object') ? merged.dispatch : {};
+
+  const includesInput = (merged.includes && typeof merged.includes === 'object') ? merged.includes : {};
   const includesDispatch = (dispatch.includes && typeof dispatch.includes === 'object') ? dispatch.includes : {};
 
   let firearmIncluded = Object.prototype.hasOwnProperty.call(includesInput, 'firearm')
@@ -548,7 +710,13 @@ function summarizeRobotPayload(payload = {}){
       : undefined;
 
   if (firearmIncluded === undefined) {
-    firearmIncluded = !!(payload.firearm || dispatch.firearm);
+    if (Object.prototype.hasOwnProperty.call(merged, 'includesFirearm')) {
+      firearmIncluded = normalizeFlag(merged.includesFirearm);
+    }
+  }
+
+  if (firearmIncluded === undefined) {
+    firearmIncluded = !!(merged.firearm || dispatch.firearm);
   }
 
   let ammoIncluded = Object.prototype.hasOwnProperty.call(includesInput, 'ammo')
@@ -558,11 +726,17 @@ function summarizeRobotPayload(payload = {}){
       : undefined;
 
   if (ammoIncluded === undefined) {
-    ammoIncluded = (Array.isArray(payload.ammo) && payload.ammo.length > 0)
+    if (Object.prototype.hasOwnProperty.call(merged, 'includesAmmo')) {
+      ammoIncluded = normalizeFlag(merged.includesAmmo);
+    }
+  }
+
+  if (ammoIncluded === undefined) {
+    ammoIncluded = (Array.isArray(merged.ammo) && merged.ammo.length > 0)
       || (Array.isArray(dispatch.ammo) && dispatch.ammo.length > 0);
   }
-  
-  const payloadItems = Array.isArray(payload.items) ? payload.items : [];
+
+  const payloadItems = Array.isArray(merged.items) ? merged.items : [];
   if (firearmIncluded === undefined) {
     firearmIncluded = payloadItems.some((item) => String(item?.item_type || item?.type || '').toUpperCase() === 'FIREARM');
   }
@@ -573,13 +747,19 @@ function summarizeRobotPayload(payload = {}){
   const firearmHas = !!firearmIncluded;
   const ammoHas = !!ammoIncluded;
 
-  let action = String(payload.mode || '').toLowerCase();
+  let action = String(merged.mode || '').toLowerCase();
+  if (!action && merged.direction) {
+    action = String(merged.direction).toLowerCase();
+  }
   if (['firearm_and_ammo', 'firearm_only', 'ammo_only', 'dispatch', 'issue', 'out', '불출'].includes(action)) {
     action = 'dispatch';
   } else if (['return', 'incoming', 'in', '입고', '불입'].includes(action)) {
     action = 'return';
   }
-  const typeRaw = String(payload.type || payload.request_type || '').toUpperCase();
+  const typeRaw = String(merged.type || merged.request_type || '').toUpperCase();
+  if (!action && merged.direction) {
+    action = ['in', '입고', '불입'].includes(String(merged.direction).toLowerCase()) ? 'return' : 'dispatch';
+  }
   if (!action){
     if (typeRaw === 'RETURN') action = 'return';
     else if (typeRaw === 'DISPATCH' || typeRaw === 'ISSUE') action = 'dispatch';
@@ -588,28 +768,31 @@ function summarizeRobotPayload(payload = {}){
     action = firearmHas || ammoHas ? 'dispatch' : 'unknown';
   }
 
-  const firearm = payload.firearm || dispatch.firearm || {};
-  const firearmCode = firearm.code
+  const firearm = merged.firearm || dispatch.firearm || {};
+  const firearmCode = merged.firearmSerial
+    || firearm.code
     || firearm.firearm_number
     || firearm.serial
     || firearm.weapon_code
-    || payload.weapon_code
-    || payload.weaponCode
+    || merged.weapon_code
+    || merged.weaponCode
     || null;
 
-  const locker = firearm.locker
+  const locker = merged.locker
+    || merged.mission
+    || merged.mission_label
+    || firearm.locker
     || firearm.locker_code
     || firearm.lockerCode
     || dispatch.locker
     || dispatch.location
-    || payload.locker
-    || payload.storage
-    || payload.storage_code
-    || (payload.request && (payload.request.locker || payload.request.storage_locker))
+    || merged.storage
+    || merged.storage_code
+    || (merged.request && (merged.request.locker || merged.request.storage_locker))
     || null;
 
-  const ammoItems = Array.isArray(payload.ammo) && payload.ammo.length
-    ? payload.ammo
+  const ammoItems = Array.isArray(merged.ammo) && merged.ammo.length
+    ? merged.ammo
     : (Array.isArray(dispatch.ammo) ? dispatch.ammo : []);
   const ammoSummaryParts = [];
   let ammoCount = 0;
@@ -636,7 +819,7 @@ function summarizeRobotPayload(payload = {}){
     : (firearmHas ? '총기' : (ammoHas ? '탄약' : '기타'));
 
   const summary = {
-    requestId: payload.requestId ?? payload.request_id ?? null,
+    requestId: merged.requestId ?? merged.request_id ?? null,
     action,
     actionLabel: action === 'return' ? '불입' : (action === 'dispatch' ? '불출' : '장비'),
     type: typeRaw || null,
@@ -645,11 +828,11 @@ function summarizeRobotPayload(payload = {}){
     ammoSummary: hasAmmoSummary ? ammoSummaryParts.join(', ') : null,
     ammoCount: hasAmmoSummary ? ammoCountValue : null,
     locker,
-    site: payload.site_id || payload.site || null,
-    purpose: payload.purpose || null,
-    location: payload.location
+    site: merged.site_id || merged.site || null,
+    purpose: merged.purpose || null,
+    location: merged.location
       || dispatch.location
-      || (payload.request && payload.request.location)
+      || (merged.request && merged.request.location)
       || null
   };
 
@@ -1075,6 +1258,11 @@ function finalizeRobotJob(job, status, info = {}){
   });
   robotState.active = null;
   robotState.lastEventAt = job.finishedAt;
+  activeJobsByRequestId.delete(String(job.requestId));
+  if (job.process && job.process.stdin && !job.process.stdin.destroyed) {
+    try { job.process.stdin.end(); }
+    catch (_) {}
+  }
   recordRobotHistory(job);
   forwardRobotEvent(job, {
     status: job.status === 'succeeded' ? 'success' : 'error',
@@ -1107,6 +1295,12 @@ function handleRobotStdout(job, line){
     job.message = obj.message || job.message;
     job.mode = obj.mode || job.mode;
     job.progress = obj;
+    if (obj.token && job.pendingTokens) {
+      job.pendingTokens.delete(obj.token);
+    }
+    if (obj.stage && job.interactions && job.interactions.has(obj.stage)) {
+      job.interactions.delete(obj.stage);
+    }
     robotState.lastEventAt = timeNow();
     log('robot progress', {
       jobId: job.id,
@@ -1142,6 +1336,79 @@ function handleRobotStdout(job, line){
       progress: obj,
       result: obj,
       error: obj.status === 'success' ? null : (obj.message || obj.error || 'robot_error')
+    });
+    return;
+  }
+  if (obj.event === 'await_user'){
+    const token = obj.token || createToken(obj.stage || 'await');
+    obj.token = token;
+    job.stage = obj.stage || job.stage || 'await_user';
+    job.message = obj.message || job.message || '사용자 입력 대기';
+    job.mode = obj.mode || job.mode;
+    job.progress = obj;
+    job.pendingTokens.set(token, obj);
+    if (obj.stage) {
+      job.interactions.set(obj.stage, token);
+    }
+    robotState.lastEventAt = timeNow();
+    forwardRobotEvent(job, {
+      status: 'progress',
+      stage: job.stage,
+      message: job.message,
+      progress: obj,
+      meta: obj
+    });
+    return;
+  }
+  if (obj.event === 'await_user_done') {
+    const token = obj.token;
+    if (token && job.pendingTokens) {
+      job.pendingTokens.delete(token);
+    }
+    if (obj.stage && job.interactions) {
+      job.interactions.delete(obj.stage);
+    }
+    job.stage = obj.stage || job.stage;
+    job.message = obj.message || job.message;
+    job.mode = obj.mode || job.mode;
+    job.progress = obj;
+    robotState.lastEventAt = timeNow();
+    forwardRobotEvent(job, {
+      status: 'progress',
+      stage: job.stage,
+      message: job.message,
+      progress: obj,
+      meta: obj
+    });
+    return;
+  }
+  if (obj.event === 'log') {
+    job.logs?.push?.({ type: 'log', text: obj.message || '', at: timeNow(), level: obj.level || 'info', stage: obj.stage || null });
+    job.stage = obj.stage || job.stage;
+    job.message = obj.message || job.message;
+    job.progress = obj;
+    forwardRobotEvent(job, {
+      status: 'progress',
+      stage: job.stage,
+      message: job.message,
+      progress: obj,
+      meta: obj
+    });
+    return;
+  }
+  if (obj.event === 'lockdown') {
+    job.stage = obj.stage || 'lockdown';
+    job.message = obj.message || '시스템 락다운';
+    job.mode = obj.mode || job.mode;
+    job.progress = obj;
+    job.error = obj.reason || job.message;
+    finalizeRobotJob(job, 'failed', {
+      stage: job.stage,
+      message: job.message,
+      mode: job.mode,
+      progress: obj,
+      error: obj.reason || obj.message || 'lockdown',
+      result: { lockdown: obj }
     });
     return;
   }
@@ -1188,6 +1455,7 @@ function startRobotJob(payload = {}){
 
   const jobId = (++robotJobCounter);
   const summary = summarizeRobotPayload(payload);
+  const scriptArgs = buildRobotScriptArgs(payload, summary);
   const site = payload.site || payload.site_id || payload.dispatch?.site_id || FP_SITE;
   const payloadPreview = buildRobotPayloadSnapshot(payload);
   const forward = extractForwardConfig(payload.forward);
@@ -1204,7 +1472,9 @@ function startRobotJob(payload = {}){
     createdAt: timeNow(),
     logs: [],
     forward,
-    waiters: []
+    waiters: [],
+    interactions: new Map(),
+    pendingTokens: new Map()
   };
 
     if (summary){
@@ -1220,7 +1490,7 @@ function startRobotJob(payload = {}){
     PYTHONIOENCODING: 'utf-8',
     PYTHONUNBUFFERED: '1'
   };
-  const proc = spawn(robotState.python || PYTHON_BIN, [robotState.script], { env });
+  const proc = spawn(robotState.python || PYTHON_BIN, [robotState.script, ...scriptArgs], { env });
   if (proc.stdin && typeof proc.stdin.setDefaultEncoding === 'function') {
     proc.stdin.setDefaultEncoding('utf8');
   }
@@ -1229,6 +1499,7 @@ function startRobotJob(payload = {}){
   job.status = 'running';
   robotState.active = job;
   robotState.lastEventAt = job.startedAt;
+  activeJobsByRequestId.set(String(requestId), job);
 
   log('robot job accepted', {
     jobId,
@@ -1239,29 +1510,11 @@ function startRobotJob(payload = {}){
     ammo: summary?.ammoSummary || null,
     site: job.site,
     python: robotState.python,
-    script: robotState.script
+    script: robotState.script,
+    args: scriptArgs
   });
 
   forwardRobotEvent(job, { status: 'accepted', stage: job.stage, message: 'job accepted' });
-
-  const input = JSON.stringify({
-    ...payload,
-    jobId,
-    site,
-    requestedAt: payload.requestedAt || job.createdAt
-  });
-
-  try {
-    proc.stdin.write(input);
-    proc.stdin.end();
-  } catch (err) {
-    try { proc.kill(); } catch (_) {}
-    robotState.active = null;
-    const error = new Error('robot_spawn_failed');
-    error.cause = err;
-    error.statusCode = 500;
-    throw error;
-  }
 
   let stdoutBuffer = '';
   proc.stdout.setEncoding('utf8');
