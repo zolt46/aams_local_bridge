@@ -378,7 +378,7 @@ async function handleBackendMessage(ws, data) {
         });
     } catch (err) {
       warn('robot execute failed:', err?.message || err);
-      sendToBackend({ type: 'ROBOT_EVENT', error: err?.message || 'robot_failed' });
+      sendToBackend({ type: 'ROBOT_EVENT', requestId: relayRequestId, error: err?.message || 'robot_failed' });
     }
     return;
   }
