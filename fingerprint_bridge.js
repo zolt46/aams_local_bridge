@@ -94,6 +94,19 @@ let lastIdentifyEvent = null;
 let lastIdentifyAt = 0;
 let lastSerialEventAt = 0;
 
+const buzzerState = { active: false, lastCommandAt: 0, reason: null, lastAckAt: 0 };
+const lockdownState = {
+  active: false,
+  stage: null,
+  message: null,
+  reason: null,
+  meta: null,
+  triggeredAt: 0,
+  clearedAt: 0,
+  clearedBy: null,
+  clearedReason: null
+};
+
 let robotJobCounter = 0;
 const ROBOT_HISTORY_LIMIT = 10;
 const robotState = {
@@ -110,6 +123,79 @@ const robotState = {
 const activeJobsByRequestId = new Map();
 
 const timeNow = () => Date.now();
+
+function applyBuzzerState(desired, { reason = null, force = false } = {}) {
+  const on = !!desired;
+  if (!force && buzzerState.active === on && serial && serial.isOpen) {
+    return true;
+  }
+  if (!serial || !serial.isOpen) {
+    warn('buzzer command skipped: serial not ready');
+    buzzerState.active = on;
+    buzzerState.reason = reason || buzzerState.reason || null;
+    return false;
+  }
+  const ok = writeSerial({ cmd: 'buzzer', state: on ? 'on' : 'off' });
+  if (ok) {
+    buzzerState.active = on;
+    buzzerState.lastCommandAt = timeNow();
+    buzzerState.reason = reason || buzzerState.reason || null;
+  }
+  return ok;
+}
+
+function snapshotLockdown(extra = {}) {
+  const base = {
+    active: !!lockdownState.active,
+    stage: lockdownState.stage || null,
+    message: lockdownState.message || null,
+    reason: lockdownState.reason || null,
+    triggeredAt: lockdownState.triggeredAt || null,
+    clearedAt: lockdownState.clearedAt || null,
+    clearedBy: lockdownState.clearedBy || null,
+    clearedReason: lockdownState.clearedReason || null,
+    meta: lockdownState.meta || null,
+    buzzer: { ...buzzerState }
+  };
+  return { ...base, ...extra };
+}
+
+function sendLockdownStatus(extra = {}) {
+  const payload = snapshotLockdown(extra);
+  sendToBackend({ type: 'LOCKDOWN_STATUS', ...payload });
+  wsBroadcast({ type: 'LOCKDOWN_STATUS', ...payload });
+}
+
+function activateLockdown({ stage, message, reason, meta } = {}) {
+  lockdownState.active = true;
+  lockdownState.stage = stage || lockdownState.stage || 'lockdown';
+  lockdownState.message = message || lockdownState.message || 'lockdown';
+  lockdownState.reason = reason || lockdownState.reason || 'lockdown';
+  lockdownState.meta = meta || lockdownState.meta || null;
+  lockdownState.triggeredAt = timeNow();
+  lockdownState.clearedAt = 0;
+  lockdownState.clearedBy = null;
+  lockdownState.clearedReason = null;
+  applyBuzzerState(true, { reason: lockdownState.reason, force: true });
+  sendLockdownStatus();
+}
+
+function clearLockdown({ reason = 'unlock', actor } = {}) {
+  const wasActive = !!lockdownState.active;
+  lockdownState.active = false;
+  lockdownState.clearedAt = timeNow();
+  lockdownState.clearedReason = reason || null;
+  lockdownState.clearedBy = actor || null;
+  if (!lockdownState.stage) lockdownState.stage = 'lockdown';
+  const resolvedReason = reason || 'unlock';
+  lockdownState.reason = resolvedReason;
+  if (!lockdownState.message || lockdownState.message === 'lockdown') {
+    lockdownState.message = resolvedReason === 'admin_unlock' ? '관리자 해제 완료' : '락다운 해제';
+  }
+  applyBuzzerState(false, { reason: 'lockdown_cleared', force: true });
+  sendLockdownStatus({ active: false, cleared: true, wasActive });
+  return wasActive;
+}
 
 function scheduleReconnect() {
   if (reconnectTimer) return;
@@ -169,6 +255,7 @@ async function handleBackendMessage(ws, data) {
       reconnectDelayMs = 2000;
       forwardStatus.lastOkAt = timeNow();
       flushBackendQueue();
+      sendLockdownStatus();
     }
     return;
   }
@@ -219,6 +306,24 @@ async function handleBackendMessage(ws, data) {
       warn('fp stop failed:', err?.message || err);
       sendToBackend({ type: 'FP_SESSION_ERROR', error: err?.message || 'stop_failed' });
     }
+    return;
+  }
+
+  if (type === 'LOCKDOWN_RELEASE') {
+    const actor = message.actor && typeof message.actor === 'object'
+      ? cleanObject({ ...message.actor })
+      : cleanObject({
+          id: message.actorId ?? message.actor_id ?? null,
+          name: message.actorName ?? message.actor_name ?? null,
+          rank: message.actorRank ?? null
+        });
+    const reason = message.reason || message.message || 'unlock';
+    clearLockdown({ reason, actor });
+    return;
+  }
+
+  if (type === 'LOCKDOWN_STATUS_REQUEST') {
+    sendLockdownStatus();
     return;
   }
 
@@ -1397,18 +1502,23 @@ function handleRobotStdout(job, line){
     return;
   }
   if (obj.event === 'lockdown') {
-    job.stage = obj.stage || 'lockdown';
-    job.message = obj.message || '시스템 락다운';
+    const stage = obj.stage || 'lockdown';
+    const message = obj.message || job.message || '시스템 락다운';
+    const reason = obj.reason || job.error || 'lockdown';
+    const meta = { ...(obj.meta || {}), requestId: job.requestId ?? null };
+    activateLockdown({ stage, message, reason, meta });
+    job.stage = stage;
+    job.message = message;
     job.mode = obj.mode || job.mode;
-    job.progress = obj;
-    job.error = obj.reason || job.message;
+    job.progress = { ...obj, meta };
+    job.error = reason;
     finalizeRobotJob(job, 'failed', {
-      stage: job.stage,
-      message: job.message,
+      stage,
+      message,
       mode: job.mode,
-      progress: obj,
-      error: obj.reason || obj.message || 'lockdown',
-      result: { lockdown: obj }
+      progress: { ...obj, meta },
+      error: reason,
+      result: { lockdown: snapshotLockdown({ stage, message, reason, meta, job: { id: job.id, requestId: job.requestId ?? null } }) }
     });
     return;
   }
@@ -1718,6 +1828,10 @@ async function openAndWire(){
 
   try { serial.write('{"cmd":"open"}\n'); } catch (err) { warn('write open failed:', err.message || err); }
 
+  if (lockdownState.active) {
+    applyBuzzerState(true, { reason: 'lockdown_resume', force: true });
+  }
+
   parser.on('data', raw => {
     const line = String(raw || '').trim();
     if (!line) return;
@@ -1745,6 +1859,14 @@ async function openAndWire(){
       ledState.ok = false;
       ledState.pending = false;
       ledState.lastCommandAt = timeNow();
+    }
+    if (obj && obj.type === 'buzzer'){
+      if (typeof obj.active === 'boolean') buzzerState.active = obj.active;
+      if (typeof obj.state === 'string'){ buzzerState.active = obj.state === 'on'; }
+      if (obj.reason) buzzerState.reason = obj.reason;
+      buzzerState.lastAckAt = timeNow();
+      buzzerState.lastCommandAt = buzzerState.lastCommandAt || buzzerState.lastAckAt;
+      sendLockdownStatus();
     }
 
     wsBroadcast(obj);
@@ -1814,6 +1936,7 @@ function buildHealthPayload(){
           error: activeCommand.error || null
         }
       : { active: false },
+    lockdown: snapshotLockdown(),
     robot: {
       enabled: !!robotState.enabled,
       python: robotState.python || null,
