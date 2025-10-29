@@ -193,7 +193,31 @@ function clearLockdown({ reason = 'unlock', actor } = {}) {
     lockdownState.message = resolvedReason === 'admin_unlock' ? '관리자 해제 완료' : '락다운 해제';
   }
   applyBuzzerState(false, { reason: 'lockdown_cleared', force: true });
-  sendLockdownStatus({ active: false, cleared: true, wasActive });
+  const releasePayload = {
+    event: 'lockdown_cleared',
+    reason: resolvedReason,
+    actor: actor || null,
+    stage: lockdownState.stage,
+    message: lockdownState.message,
+    meta: lockdownState.meta || null,
+    timestamp: timeNow()
+  };
+  sendLockdownStatus({ active: false, cleared: true, wasActive, release: releasePayload });
+  if (
+    wasActive &&
+    robotState.active &&
+    robotState.active.process &&
+    !robotState.active.process.killed &&
+    robotState.active.process.stdin &&
+    robotState.active.process.stdin.writable
+  ) {
+    try {
+      robotState.active.process.stdin.write(`${JSON.stringify(releasePayload)}\n`);
+      robotState.active.logs?.push?.({ type: 'stdin', text: JSON.stringify(releasePayload), at: timeNow() });
+    } catch (err) {
+      warn('failed to notify robot of lockdown clearance', err?.message || err);
+    }
+  }
   return wasActive;
 }
 
