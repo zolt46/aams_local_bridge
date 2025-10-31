@@ -69,6 +69,17 @@ const ROBOT_DISABLED = (process.env.ROBOT_DISABLED || '') === '1';
 const ROBOT_FORWARD_URL = process.env.ROBOT_FORWARD_URL || process.env.RENDER_ROBOT_URL || '';
 const ROBOT_FORWARD_TOKEN = process.env.ROBOT_FORWARD_TOKEN || process.env.RENDER_ROBOT_TOKEN || FORWARD_TOKEN || '';
 
+const RAIL_DISABLED = (process.env.RAIL_DISABLED || '') === '1';
+const RAIL_LOCKDOWN_POSITION = Number(process.env.RAIL_LOCKDOWN_POSITION || 800);
+const RAIL_LOCKDOWN_SPEED = Number(process.env.RAIL_LOCKDOWN_SPEED || 200);
+const RAIL_BRIDGE_HOST = process.env.RAIL_BRIDGE_HOST
+  || process.env.ROBOT_BRIDGE_HOST
+  || process.env.ROBOT_HOST
+  || process.env.BRIDGE_HOST
+  || '127.0.0.1';
+const RAIL_SCRIPT = path.join(__dirname, 'rail_control.py');
+const RAIL_COMMAND_TIMEOUT_MS = Number(process.env.RAIL_COMMAND_TIMEOUT_MS || 45000);
+
 
 function log(...args){ console.log('[fp-bridge]', ...args); }
 function warn(...args){ console.warn('[fp-bridge]', ...args); }
@@ -124,6 +135,9 @@ const activeJobsByRequestId = new Map();
 
 const timeNow = () => Date.now();
 
+let railCommandQueue = Promise.resolve();
+let railScriptMissingWarned = false;
+
 function applyBuzzerState(desired, { reason = null, force = false } = {}) {
   const on = !!desired;
   if (!force && buzzerState.active === on && serial && serial.isOpen) {
@@ -142,6 +156,119 @@ function applyBuzzerState(desired, { reason = null, force = false } = {}) {
     buzzerState.reason = reason || buzzerState.reason || null;
   }
   return ok;
+}
+
+function runRailCommand(action, { reason = null } = {}) {
+  if (RAIL_DISABLED) {
+    log('[rail] command skipped (disabled)', action, reason || null);
+    return Promise.resolve({ ok: false, skipped: true, reason: 'rail_disabled', action });
+  }
+  if (!fs.existsSync(RAIL_SCRIPT)) {
+    if (!railScriptMissingWarned) {
+      railScriptMissingWarned = true;
+      warn('[rail] control script not found, skipping commands', RAIL_SCRIPT);
+    }
+    return Promise.resolve({ ok: false, skipped: true, reason: 'script_missing', action });
+  }
+
+  return new Promise((resolve) => {
+    const args = [RAIL_SCRIPT, '--action', action];
+    if (RAIL_BRIDGE_HOST) {
+      args.push('--host', RAIL_BRIDGE_HOST);
+    }
+    if (Number.isFinite(RAIL_LOCKDOWN_SPEED)) {
+      args.push('--speed', String(RAIL_LOCKDOWN_SPEED));
+    }
+    if (action === 'extend' || action === 'position') {
+      if (Number.isFinite(RAIL_LOCKDOWN_POSITION)) {
+        args.push('--position', String(RAIL_LOCKDOWN_POSITION));
+      }
+    }
+
+    const proc = spawn(PYTHON_BIN, args, {
+      cwd: path.dirname(RAIL_SCRIPT)
+    });
+    let stdout = '';
+    let stderr = '';
+    let settled = false;
+
+    const finalize = (payload = {}, error = null) => {
+      if (settled) return;
+      settled = true;
+      const result = typeof payload === 'object' && payload ? { ...payload } : {};
+      result.action = action;
+      result.reason = reason || result.reason || null;
+      if (error) {
+        result.ok = false;
+        result.error = error.message || String(error);
+      }
+      if (stderr.trim()) {
+        result.stderr = stderr.trim();
+      }
+      if (result.ok === false) {
+        warn('[rail] command failed', result);
+      } else {
+        log('[rail] command completed', {
+          action,
+          position: result.position ?? result.current_position ?? null
+        });
+      }
+      resolve(result);
+    };
+
+    const timeout = setTimeout(() => {
+      try { proc.kill('SIGTERM'); }
+      catch (_) {}
+      finalize({ ok: false, error: 'timeout' });
+    }, Math.max(5000, RAIL_COMMAND_TIMEOUT_MS));
+
+    proc.stdout?.on('data', (chunk) => {
+      stdout += String(chunk || '');
+    });
+
+    proc.stderr?.on('data', (chunk) => {
+      stderr += String(chunk || '');
+    });
+
+    proc.on('error', (err) => {
+      clearTimeout(timeout);
+      finalize({ ok: false }, err);
+    });
+
+    proc.on('close', (code, signal) => {
+      clearTimeout(timeout);
+      let payload = null;
+      const text = stdout.trim();
+      if (text) {
+        const lines = text.split(/\r?\n/).filter(Boolean);
+        const lastLine = lines[lines.length - 1];
+        try {
+          payload = JSON.parse(lastLine);
+        } catch (err) {
+          warn('[rail] failed to parse response', err?.message || err, lastLine);
+        }
+      }
+      if (!payload || typeof payload !== 'object') {
+        payload = { ok: code === 0 };
+      } else if (payload.ok === undefined) {
+        payload.ok = code === 0;
+      }
+      if (code !== 0 || signal) {
+        payload.ok = false;
+        payload.error = payload.error || `exit_${code ?? signal ?? 'unknown'}`;
+      }
+      finalize(payload);
+    });
+  });
+}
+
+function enqueueRailCommand(action, context = {}) {
+  railCommandQueue = railCommandQueue
+    .catch((err) => {
+      warn('[rail] previous command failed', err?.message || err);
+    })
+    .then(() => runRailCommand(action, context));
+  return railCommandQueue;
 }
 
 function snapshotLockdown(extra = {}) {
@@ -177,6 +304,9 @@ function activateLockdown({ stage, message, reason, meta } = {}) {
   lockdownState.clearedBy = null;
   lockdownState.clearedReason = null;
   applyBuzzerState(true, { reason: lockdownState.reason, force: true });
+  enqueueRailCommand('extend', { reason: lockdownState.reason }).catch((err) => {
+    warn('[rail] extend enqueue failed', err?.message || err);
+  });
   sendLockdownStatus();
 }
 
@@ -193,6 +323,9 @@ function clearLockdown({ reason = 'unlock', actor } = {}) {
     lockdownState.message = resolvedReason === 'admin_unlock' ? '관리자 해제 완료' : '락다운 해제';
   }
   applyBuzzerState(false, { reason: 'lockdown_cleared', force: true });
+  enqueueRailCommand('home', { reason: resolvedReason }).catch((err) => {
+    warn('[rail] home enqueue failed', err?.message || err);
+  });
   const releasePayload = {
     event: 'lockdown_cleared',
     reason: resolvedReason,
