@@ -333,6 +333,16 @@ async function handleBackendMessage(ws, data) {
     return;
   }
 
+  if (type === 'LOCKDOWN_TRIGGER') {
+    const stage = message.stage || 'emergency_manual';
+    const reason = message.reason || 'lockdown';
+    const msg = message.message || message.note || '긴급 개방 프로토콜 시행';
+    const actor = message.actor && typeof message.actor === 'object' ? cleanObject({ ...message.actor }) : message.actor || null;
+    const meta = { ...(message.meta || {}), actor };
+    activateLockdown({ stage, reason, message: msg, meta });
+    return;
+  }
+
   if (type === 'LOCKDOWN_RELEASE') {
     const actor = message.actor && typeof message.actor === 'object'
       ? cleanObject({ ...message.actor })
