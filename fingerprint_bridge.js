@@ -105,7 +105,7 @@ let lastIdentifyEvent = null;
 let lastIdentifyAt = 0;
 let lastSerialEventAt = 0;
 
-const buzzerState = { active: false, lastCommandAt: 0, reason: null, lastAckAt: 0, pattern: null };
+const buzzerState = { active: false, lastCommandAt: 0, reason: null, lastAckAt: 0 };
 const lockdownState = {
   active: false,
   stage: null,
@@ -137,56 +137,6 @@ const timeNow = () => Date.now();
 
 let railCommandQueue = Promise.resolve();
 let railScriptMissingWarned = false;
-
-const LOCKDOWN_BUZZER_ON_MS = Math.max(Number(process.env.LOCKDOWN_BUZZER_ON_MS) || 1200, 300);
-const LOCKDOWN_BUZZER_OFF_MS = Math.max(Number(process.env.LOCKDOWN_BUZZER_OFF_MS) || 2400, 600);
-let lockdownBuzzerTimer = null;
-let lockdownBuzzerPhase = 'off';
-let lockdownBuzzerReason = 'lockdown';
-
-function clearLockdownBuzzerTimer() {
-  if (lockdownBuzzerTimer) {
-    clearTimeout(lockdownBuzzerTimer);
-    lockdownBuzzerTimer = null;
-  }
-}
-
-function scheduleLockdownBuzzerTick() {
-  if (!lockdownState.active) {
-    clearLockdownBuzzerTimer();
-    return;
-  }
-
-  const nextPhase = lockdownBuzzerPhase === 'on' ? 'off' : 'on';
-  const reason = lockdownBuzzerReason || lockdownState.reason || 'lockdown';
-  const delay = nextPhase === 'on' ? LOCKDOWN_BUZZER_ON_MS : LOCKDOWN_BUZZER_OFF_MS;
-
-  if (nextPhase === 'on') {
-    applyBuzzerState(true, { reason, force: true });
-  } else {
-    applyBuzzerState(false, { reason, force: true });
-  }
-
-  lockdownBuzzerPhase = nextPhase;
-  clearLockdownBuzzerTimer();
-  lockdownBuzzerTimer = setTimeout(scheduleLockdownBuzzerTick, delay);
-}
-
-function startLockdownBuzzerPattern(reason) {
-  lockdownBuzzerReason = reason || lockdownState.reason || 'lockdown';
-  lockdownBuzzerPhase = 'off';
-  clearLockdownBuzzerTimer();
-  buzzerState.pattern = 'pulse';
-  scheduleLockdownBuzzerTick();
-}
-
-function stopLockdownBuzzerPattern({ reason = 'lockdown_cleared', force = true } = {}) {
-  lockdownBuzzerReason = reason || lockdownBuzzerReason || 'lockdown';
-  clearLockdownBuzzerTimer();
-  lockdownBuzzerPhase = 'off';
-  buzzerState.pattern = null;
-  applyBuzzerState(false, { reason: lockdownBuzzerReason, force });
-}
 
 function applyBuzzerState(desired, { reason = null, force = false } = {}) {
   const on = !!desired;
@@ -353,7 +303,10 @@ function activateLockdown({ stage, message, reason, meta } = {}) {
   lockdownState.clearedAt = 0;
   lockdownState.clearedBy = null;
   lockdownState.clearedReason = null;
-  startLockdownBuzzerPattern(lockdownState.reason);
+  applyBuzzerState(true, { reason: lockdownState.reason, force: true });
+  enqueueRailCommand('extend', { reason: lockdownState.reason }).catch((err) => {
+    warn('[rail] extend enqueue failed', err?.message || err);
+  });
   sendLockdownStatus();
 }
 
@@ -369,7 +322,10 @@ function clearLockdown({ reason = 'unlock', actor } = {}) {
   if (!lockdownState.message || lockdownState.message === 'lockdown') {
     lockdownState.message = resolvedReason === 'admin_unlock' ? '관리자 해제 완료' : '락다운 해제';
   }
-  stopLockdownBuzzerPattern({ reason: resolvedReason, force: true });
+  applyBuzzerState(false, { reason: 'lockdown_cleared', force: true });
+  enqueueRailCommand('home', { reason: resolvedReason }).catch((err) => {
+    warn('[rail] home enqueue failed', err?.message || err);
+  });
   const releasePayload = {
     event: 'lockdown_cleared',
     reason: resolvedReason,
@@ -2040,7 +1996,7 @@ async function openAndWire(){
   try { serial.write('{"cmd":"open"}\n'); } catch (err) { warn('write open failed:', err.message || err); }
 
   if (lockdownState.active) {
-    startLockdownBuzzerPattern(lockdownState.reason || 'lockdown_resume');
+    applyBuzzerState(true, { reason: 'lockdown_resume', force: true });
   }
 
   parser.on('data', raw => {
